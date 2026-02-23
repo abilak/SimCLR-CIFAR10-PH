@@ -1,5 +1,5 @@
 __pycache__/
-logs/
 outputs/
 simclr_hk.py
 data/
+runs/*stream

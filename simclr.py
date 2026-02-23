@@ -436,19 +436,18 @@ def train(args: DictConfig) -> None:
         cudnn.benchmark = True
 
     seed = int(getattr(args, "seed", 0))
-    if seed:
-        set_seed(seed)
+    set_seed(seed)
 
     # Hydra run dir
     out_dir = os.getcwd()
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints", "upstream", args.method)
+    ckpt_dir = os.path.join(out_dir, "checkpoints", "upstream", args.method, f"seed{args.seed}")
     ensure_dir(ckpt_dir)
 
-    viz_dir = os.path.join(out_dir, "visuals", "upstream", args.method)
-    ensure_dir(viz_dir)
-    hist = HistoryLogger(out_dir=viz_dir, filename=f"{args.method}_train_history.csv") 
+    log_dir  = os.path.join(out_dir, "logs", "upstream", args.method, f"seed{args.seed}")
+    ensure_dir(log_dir)
 
+    hist = HistoryLogger(out_dir=log_dir, filename=f"{args.method}_seed{args.seed}_train_history.csv") 
     # Data
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(32),
@@ -518,13 +517,9 @@ def train(args: DictConfig) -> None:
     ph_featurizer.train()
 
     temperature = float(args.temperature)
-    tau_ph = float(args.loss.teacher_temperature)
     tau_student = float(args.loss.student_temperature)
 
     warmup_epochs = int(getattr(args.train, "warmup_epochs", 0))
-    topk_cfg = int(getattr(args.loss, "ph_topk", 0))
-    ph_topk = topk_cfg if topk_cfg > 0 else None
-    align_w = float(getattr(args.loss, "ph_proj_align", 0.0))
 
     for epoch in range(1, int(args.epochs) + 1):
         loss_meter = AverageMeter("loss")
@@ -533,6 +528,7 @@ def train(args: DictConfig) -> None:
         for step, (x, _) in enumerate(bar):
             if max_steps is not None and step >= max_steps:
                 break
+                
 
             B = x.size(0)
             x = x.view(B * 2, x.size(2), x.size(3), x.size(4)).to(
@@ -600,16 +596,21 @@ def train(args: DictConfig) -> None:
                 "ph_featurizer": ph_featurizer.state_dict(),
                 "config": OmegaConf.to_container(args, resolve=True),
             }
-            ckpt_name = f"simclr_{args.method}_{args.backbone}_epoch{epoch}.pt"
-            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+            ckpt_name = f"simclr_{args.method}_{args.backbone}_epoch{epoch}_seed{args.seed}.pt"
+            epoch_ckpt_dir = os.path.join(ckpt_dir, f"epoch{epoch}")
+            ensure_dir(epoch_ckpt_dir)
+            ckpt_path = os.path.join(epoch_ckpt_dir, ckpt_name)
+
             logger.info(f"==> Save checkpoint: {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
         # End-of-epoch logging + plots
         current_lr = optimizer.param_groups[0]["lr"]
-        tag = f"{args.method}_{args.backbone}"
-        if int(args.seed) != 0:
-            tag += f"_seed{args.seed}"
+        viz_dir = os.path.join(out_dir, "visuals", "upstream", args.method, f"seed{args.seed}", f"epoch{epoch}")
+        ensure_dir(viz_dir)
+
+        tag = f"{args.method}_{args.backbone}_seed{args.seed}"
+        hist.out_dir = viz_dir  # save epoch-wise visuals in separate subdirs
 
         # ---  Γ(f) evaluation ---
         gamma = eval_gamma_class_separation(

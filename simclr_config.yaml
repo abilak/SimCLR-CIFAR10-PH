@@ -21,6 +21,7 @@ temperature: 0.5
 projection_dim: 64
 seed: 0
 
+
 # Choose: baseline | phsim | hybrid
 method: baseline
 

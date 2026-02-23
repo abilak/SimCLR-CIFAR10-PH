@@ -6,3 +6,5 @@ matplotlib
 ripser
 torchph
 ninja
+pandas
+numpy

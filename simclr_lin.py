@@ -36,10 +36,11 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 class HistoryLogger:
-    def __init__(self, out_dir: str, filename: str = "lin_history.csv"):
+    def __init__(self, out_dir: str, filename: str = "lin_history.csv", viz_dir: str = None):
         self.out_dir = out_dir
         ensure_dir(out_dir)
         self.csv_path = os.path.join(out_dir, filename)
+        self.viz_dir = viz_dir
         self.rows = []
         with open(self.csv_path, "w", newline="") as f:
             w = csv.writer(f)
@@ -68,7 +69,7 @@ class HistoryLogger:
         plt.ylabel("loss")
         plt.title(f"Linear Eval Loss ({tag})")
         plt.legend()
-        plt.savefig(os.path.join(self.out_dir, f"lin_loss_{tag}.png"), dpi=150)
+        plt.savefig(os.path.join(self.viz_dir, f"lin_loss_{tag}.png"), dpi=150)
         plt.close()
 
         plt.figure()
@@ -78,7 +79,7 @@ class HistoryLogger:
         plt.ylabel("accuracy")
         plt.title(f"Linear Eval Accuracy ({tag})")
         plt.legend()
-        plt.savefig(os.path.join(self.out_dir, f"lin_acc_{tag}.png"), dpi=150)
+        plt.savefig(os.path.join(self.viz_dir, f"lin_acc_{tag}.png"), dpi=150)
         plt.close()
 
         plt.figure()
@@ -88,7 +89,7 @@ class HistoryLogger:
         plt.ylabel("accuracy")
         plt.title(f"Robust Accuracy ({tag})")
         plt.legend()
-        plt.savefig(os.path.join(self.out_dir, f"lin_robust_{tag}.png"), dpi=150)
+        plt.savefig(os.path.join(self.viz_dir, f"lin_robust_{tag}.png"), dpi=150)
         plt.close()
 
 def _clamp(x, lo=0.0, hi=1.0):
@@ -286,13 +287,14 @@ def finetune(args: DictConfig) -> None:
     # Hydra run dir for outputs
     out_dir = os.getcwd()
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints", args.method, "downstream")
-    viz_dir = os.path.join(out_dir, "visuals", args.method, "downstream")
-
+    ckpt_dir = os.path.join(out_dir, "checkpoints", "downstream", args.method, f"seed{args.seed}")
+    viz_dir  = os.path.join(out_dir, "visuals",     "downstream", args.method, f"seed{args.seed}")
+    log_dir  = os.path.join(out_dir, "logs",        "downstream", args.method, f"seed{args.seed}")
     ensure_dir(ckpt_dir)
     ensure_dir(viz_dir)
+    ensure_dir(log_dir)
 
-    hist = HistoryLogger(viz_dir, filename=f"lin_history_{args.method}_{args.backbone}.csv")
+    hist = HistoryLogger(log_dir, filename=f"lin_history_{args.method}_{args.backbone}.csv", viz_dir=viz_dir)
 
     # Simple transforms for linear eval (common practice: light aug on train, standard on test)
     train_transform = transforms.Compose([
@@ -339,7 +341,7 @@ def finetune(args: DictConfig) -> None:
     ).to(device)
 
     # Load checkpoint produced by simclr.py
-    ckpt_path = f"checkpoints/upstream/{args.method}/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}.pt"
+    ckpt_path = f"checkpoints/upstream/{args.method}/seed{args.seed}/epoch{int(args.load_epoch)}/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}_seed{int(args.seed)}.pt"
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"
@@ -384,7 +386,7 @@ def finetune(args: DictConfig) -> None:
             f"(subset={len(indices)}, batch_size={int(args.batch_size)}, drop_last={False})"
         )
     lr_max = lin_lr
-    lr_min = 1e-3
+    lr_min = float(args.optim.lr_min)
 
     scheduler = LambdaLR(
         optimizer,
@@ -405,9 +407,7 @@ def finetune(args: DictConfig) -> None:
             pgd_acc = adv["adv_pgd_acc"]
 
         current_lr = optimizer.param_groups[0]["lr"]
-        tag = f"{args.method}_{args.backbone}_bs{args.batch_size}"
-        if int(args.seed) != 0:
-            tag += f"_seed{args.seed}"
+        tag = f"{args.method}_{args.backbone}_bs{args.batch_size}_seed{args.seed}"
 
         hist.log_epoch(epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, current_lr)
         hist.plot(tag=tag)
@@ -417,7 +417,7 @@ def finetune(args: DictConfig) -> None:
             best_epoch = epoch
             logger.info("==> New best test acc")
             best_name = f"simclr_lin_{tag}_best.pth"
-            best_path = os.path.join(ckpt_dir, args.method, best_name)
+            best_path = os.path.join(ckpt_dir, best_name)
             torch.save(model.state_dict(), best_path)
 
     logger.info(f"Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")

@@ -75,3 +75,72 @@ Difference of SimCLR training from original paper:
 base SGD optimizer. We only keep the SGD optimzer and cosine annealing. 
 * No warmup.
 
+
+## Reproducing Γ vs PGD Robustness Experiments
+
+This pipeline:
+
+1. Trains upstream SSL (baseline / PHSim)
+2. Runs downstream linear evaluation with PGD
+3. Produces a **Γ vs PGD robustness** plot
+
+
+### Train Upstream Models
+
+```bash
+python sweep_upstream_train.py \
+  --preset paper_fast \
+  --methods baseline,phsim \
+  --backbone resnet18 \
+  --seeds 0,1,2
+```
+
+Outputs saved in:
+
+```
+runs/upstream/{method}_...
+```
+
+Each run contains:
+
+* checkpoints
+* `*_train_history.csv` (includes Γ per epoch)
+
+### Run Downstream + Robustness Evaluation
+
+```bash
+python sweep_full_pipeline.py \
+  --upstream_run_dir runs/upstream/phsim_resnet18_e50_sub-1_ms-1_seed0 \
+  --method phsim \
+  --backbone resnet18
+```
+
+Repeat for baseline.
+
+This automatically:
+
+* Evaluates all upstream checkpoints
+* Computes PGD-10 robust accuracy
+* Generates:
+
+```
+gamma_vs_pgd_merged.csv
+gamma_vs_pgd_scatter.png
+```
+
+
+### Final Output
+
+The key figure:
+
+[
+\Gamma(f) \quad \text{vs} \quad \text{PGD-10 Robust Accuracy}
+]
+
+This validates the hypothesis that increasing topological separation improves adversarial robustness.
+
+### Quick Dev Run
+
+```bash
+python sweep_upstream_train.py --preset dev --methods baseline,phsim
+```
