@@ -1,33 +1,19 @@
+# sweep_upstream_train.py
 """
-sweep_upstream_train.py
+Runs SimCLR upstream (pretraining) sweeps over methods × seeds.
 
-Runs SimCLR upstream (pretraining) sweeps over methods × seeds with clean output structure.
-
-File structure produced:
+Each run is fully self-contained under:
   runs/upstream/{method}_{backbone}_e{E}_seed{seed}/
-    checkpoints/upstream/{method}/   <- .pt files from simclr.py
-    visuals/upstream/{method}/       <- loss/lr/gamma pngs + CSV
-    .hydra/                          <- hydra config snapshot
-
-Usage examples:
-  # Quick dev smoke-test (2 epochs, 500 samples, 100 steps/epoch)
-  python sweep_upstream_train.py --preset dev --methods baseline,phsim --seeds 0
-
-  # Medium run
-  python sweep_upstream_train.py --preset paper_fast --methods baseline,phsim --seeds 0,1
-
-  # Full paper run
-  python sweep_upstream_train.py --preset paper_full --methods baseline,phsim,hybrid --seeds 0,1,2 --save_every 10
+    checkpoints/upstream/{method}/seed{seed}/epoch{K}/simclr_...pt
+    logs/upstream/{method}/seed{seed}/{method}_seed{seed}_train_history.csv
+    visuals/upstream/{method}/seed{seed}/epoch{K}/(loss/lr/gamma PNGs)
+    .hydra/
 """
 
 import argparse
 import subprocess
 from pathlib import Path
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def run(cmd: list[str], dry_run: bool = False):
     print("\n[CMD]", " ".join(str(c) for c in cmd))
@@ -40,37 +26,25 @@ def dir_nonempty(p: Path) -> bool:
 
 
 PRESETS = {
-    # (epochs, subset_size, max_steps_per_epoch)
     "dev":        (2,   500,   50),
     "paper_fast": (50,  -1,    -1),
     "paper_full": (200, -1,    -1),
 }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    ap.add_argument("--backbone",   default="resnet18",      choices=["resnet18", "resnet34"])
+    ap.add_argument("--backbone",   default="resnet18", choices=["resnet18", "resnet34"])
     ap.add_argument("--methods",    default="baseline,phsim", help="Comma list: baseline,phsim,hybrid")
-    ap.add_argument("--seeds",      default="0",              help="Comma list of integer seeds")
-    ap.add_argument("--preset",     default="paper_fast",     choices=list(PRESETS),
-                    help="Epoch/data preset. dev=smoke-test, paper_fast=50ep, paper_full=200ep")
+    ap.add_argument("--seeds",      default="0", help="Comma list of integer seeds")
+    ap.add_argument("--preset",     default="paper_fast", choices=list(PRESETS))
+    ap.add_argument("--save_every", type=int, default=5, help="Checkpoint/log interval in epochs")
+    ap.add_argument("--overwrite",  action="store_true")
+    ap.add_argument("--dry_run",    action="store_true")
 
-    ap.add_argument("--save_every", type=int, default=5,
-                    help="Checkpoint + CSV log interval (epochs).")
-    ap.add_argument("--overwrite",  action="store_true",
-                    help="Allow re-running into an existing non-empty run dir.")
-    ap.add_argument("--dry_run",    action="store_true",
-                    help="Print commands without executing them.")
-
-    # optional overrides (override preset values)
-    ap.add_argument("--epochs",      type=int, default=None, help="Override preset epoch count.")
-    ap.add_argument("--subset_size", type=int, default=None, help="Override preset subset_size.")
-    ap.add_argument("--max_steps",   type=int, default=None, help="Override preset max_steps.")
+    ap.add_argument("--epochs",      type=int, default=None)
+    ap.add_argument("--subset_size", type=int, default=None)
+    ap.add_argument("--max_steps",   type=int, default=None)
 
     args = ap.parse_args()
 
@@ -88,19 +62,14 @@ def main():
     base_out.mkdir(parents=True, exist_ok=True)
 
     planned = [(seed, method) for seed in seeds for method in methods]
-    print(f"[Info] Planning {len(planned)} runs: methods={methods}, seeds={seeds}, "
-          f"backbone={backbone}, preset={args.preset} "
-          f"(epochs={epochs}, subset={subset_size}, max_steps={max_steps})")
+    print(f"[Info] Planning {len(planned)} upstream runs")
 
     for seed, method in planned:
         run_name = f"{method}_{backbone}_e{epochs}_seed{seed}"
         run_dir  = base_out / run_name
 
         if dir_nonempty(run_dir) and not args.overwrite:
-            raise RuntimeError(
-                f"\nRun dir already exists and is non-empty:\n  {run_dir}\n"
-                f"Use --overwrite to allow reuse, or change --preset / --seeds / --methods."
-            )
+            raise RuntimeError(f"Run dir exists and non-empty: {run_dir} (use --overwrite)")
 
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,7 +87,7 @@ def main():
         ]
         run(cmd, dry_run=args.dry_run)
 
-    print(f"\n[Done] Upstream sweeps completed. Outputs under: {base_out.resolve()}")
+    print(f"\n[Done] Upstream sweeps completed → {base_out.resolve()}")
 
 
 if __name__ == "__main__":

@@ -1,19 +1,36 @@
+# simclr_lin.py
+#!/usr/bin/env python3
 """
 simclr_lin.py
 
-Run examples:
-  python simclr_lin.py backbone=resnet18 method=baseline load_epoch=10
-  python simclr_lin.py backbone=resnet18 method=phsim    load_epoch=10
-  python simclr_lin.py backbone=resnet18 method=hybrid   load_epoch=10
+Linear evaluation on CIFAR-10 with optional PGD epsilon sweep.
+Designed to work with Hydra run dirs like:
+  logs/downstream/{method}/seed{seed}/upE{load_epoch}/
+
+Run examples (single run):
+  python simclr_lin.py backbone=resnet18 method=baseline seed=0 load_epoch=10 \
+    hydra.run.dir=logs/downstream/baseline/seed0/upE10 \
+    attack.enabled=true attack.sweep=true attack.eps_px=[0,2,4,6,8,10] \
+    attack.pgd_steps=10 attack.pgd_alpha=-1.0 attack.pgd_random_start=true
+
+Outputs (inside the hydra run dir):
+  - logs/lin_history_{method}_{backbone}.csv
+  - logs/eps_curve_{method}_{backbone}_seed{seed}_load{load_epoch}.json
+  - visuals/eps_sweep_{method}_seed{seed}_load{load_epoch}.png
 """
 
 import os
 import csv
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Any, List
+
+import numpy as np
 import matplotlib.pyplot as plt
+
 import hydra
 from omegaconf import DictConfig, OmegaConf
-import logging
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -25,90 +42,71 @@ from torchvision import transforms
 from torchvision.models import resnet18, resnet34
 from tqdm import tqdm
 
-from models import SimCLR 
+from models import SimCLR
 
 logger = logging.getLogger(__name__)
 
+
 # -------------------------
-# Utilities
+# FS utils
 # -------------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-class HistoryLogger:
-    def __init__(self, out_dir: str, filename: str = "lin_history.csv", viz_dir: str = None):
-        self.out_dir = out_dir
-        ensure_dir(out_dir)
-        self.csv_path = os.path.join(out_dir, filename)
-        self.viz_dir = viz_dir
-        self.rows = []
-        with open(self.csv_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["epoch", "train_loss", "train_acc", "test_loss", "test_acc", "pgd_acc", "lr"])
-
-    def log_epoch(self, epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr):
-        self.rows.append((epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr))
-        with open(self.csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr])
-
-    def plot(self, tag):
-        if not self.rows:
-            return
-        epochs = [r[0] for r in self.rows]
-        train_losses = [r[1] for r in self.rows]
-        train_accs = [r[2] for r in self.rows]
-        test_losses = [r[3] for r in self.rows]
-        test_accs = [r[4] for r in self.rows]
-        pgd_accs = [r[5] for r in self.rows]
-
-        plt.figure()
-        plt.plot(epochs, train_losses, label="train")
-        plt.plot(epochs, test_losses, label="test")
-        plt.xlabel("epoch")
-        plt.ylabel("loss")
-        plt.title(f"Linear Eval Loss ({tag})")
-        plt.legend()
-        plt.savefig(os.path.join(self.viz_dir, f"lin_loss_{tag}.png"), dpi=150)
-        plt.close()
-
-        plt.figure()
-        plt.plot(epochs, train_accs, label="train")
-        plt.plot(epochs, test_accs, label="test")
-        plt.xlabel("epoch")
-        plt.ylabel("accuracy")
-        plt.title(f"Linear Eval Accuracy ({tag})")
-        plt.legend()
-        plt.savefig(os.path.join(self.viz_dir, f"lin_acc_{tag}.png"), dpi=150)
-        plt.close()
-
-        plt.figure()
-        plt.plot(epochs, test_accs, label="clean test")
-        plt.plot(epochs, pgd_accs, label="PGD-10 test")
-        plt.xlabel("epoch")
-        plt.ylabel("accuracy")
-        plt.title(f"Robust Accuracy ({tag})")
-        plt.legend()
-        plt.savefig(os.path.join(self.viz_dir, f"lin_robust_{tag}.png"), dpi=150)
-        plt.close()
 
 def _clamp(x, lo=0.0, hi=1.0):
     return torch.clamp(x, lo, hi)
 
-# FGSM and PGD implementations adapted for adversarial attack evaluation 
-def fgsm_attack(model, x, y, eps, clamp_min=0.0, clamp_max=1.0):
-    x_adv = x.detach().clone().requires_grad_(True)
-    logits = model(x_adv)
-    loss = F.cross_entropy(logits, y)
-    model.zero_grad(set_to_none=True)
-    if x_adv.grad is not None:
-        x_adv.grad.zero_()
-    loss.backward()
-    with torch.no_grad():
-        x_adv = x_adv + eps * x_adv.grad.sign()
-        x_adv = _clamp(x_adv, clamp_min, clamp_max)
-    return x_adv.detach()
 
+def _parse_eps_list(attack_cfg) -> List[float]:
+    """
+    Returns eps list (floats).
+    Supports:
+      - attack.eps_list: list of floats
+      - attack.eps_px: list of ints interpreted as /255
+      - attack.eps: single float fallback
+    """
+    eps_list = getattr(attack_cfg, "eps_list", None)
+    if eps_list is not None:
+        return [float(e) for e in eps_list]
+
+    eps_px = getattr(attack_cfg, "eps_px", None)
+    if eps_px is not None:
+        return [float(e) / 255.0 for e in eps_px]
+
+    eps = float(getattr(attack_cfg, "eps", 8 / 255))
+    return [eps]
+
+
+def resolve_upstream_ckpt(orig_cwd: str, method: str, seed: int, load_epoch: int, backbone: str) -> str:
+    """
+    Robustly locate upstream checkpoint even if directory layout differs.
+    Tries common candidates, then falls back to recursive glob under repo root.
+    """
+    pat = f"simclr_{method}_{backbone}_epoch{load_epoch}_seed{seed}.pt"
+
+    candidates = [
+        Path(orig_cwd) / "checkpoints" / "upstream" / method / f"seed{seed}" / f"epoch{load_epoch}" / pat,
+        Path(orig_cwd) / "checkpoints" / "upstream" / method / f"seed{seed}" / pat,
+        Path(orig_cwd) / "checkpoints" / pat,
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+
+    hits = sorted(Path(orig_cwd).glob(f"**/{pat}"), key=lambda x: str(x))
+    if hits:
+        return str(hits[0])
+
+    raise FileNotFoundError(
+        f"Could not find upstream checkpoint for pattern {pat} under repo root {orig_cwd}.\n"
+        f"Tried: {candidates[:3]}"
+    )
+
+
+# -------------------------
+# Attacks
+# -------------------------
 def pgd_attack(model, x, y, eps, alpha, steps, random_start=True, clamp_min=0.0, clamp_max=1.0):
     x0 = x.detach()
     if random_start:
@@ -121,19 +119,25 @@ def pgd_attack(model, x, y, eps, alpha, steps, random_start=True, clamp_min=0.0,
         x_adv.requires_grad_(True)
         logits = model(x_adv)
         loss = F.cross_entropy(logits, y)
+
         model.zero_grad(set_to_none=True)
         if x_adv.grad is not None:
             x_adv.grad.zero_()
         loss.backward()
+
         with torch.no_grad():
             x_adv = x_adv + alpha * x_adv.grad.sign()
             x_adv = torch.max(torch.min(x_adv, x0 + eps), x0 - eps)
             x_adv = _clamp(x_adv, clamp_min, clamp_max)
+
     return x_adv.detach()
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self, name):
+
+# -------------------------
+# Meters / LR schedule
+# -------------------------
+class AverageMeter:
+    def __init__(self, name: str):
         self.name = name
         self.reset()
 
@@ -152,29 +156,85 @@ class AverageMeter(object):
 
 
 def get_lr(step, total_steps, lr_max, lr_min):
-    """Cosine annealing schedule (returns absolute LR)."""
     return lr_min + (lr_max - lr_min) * 0.5 * (1 + np.cos(step / total_steps * np.pi))
 
 
 # -------------------------
-# Linear eval head on pooled features h
+# Logging
+# -------------------------
+class HistoryLogger:
+    def __init__(self, out_dir: str, filename: str, viz_dir: str):
+        self.out_dir = out_dir
+        ensure_dir(out_dir)
+        self.csv_path = os.path.join(out_dir, filename)
+        self.viz_dir = viz_dir
+        ensure_dir(viz_dir)
+        self.rows = []
+        with open(self.csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch", "train_loss", "train_acc", "test_loss", "test_acc", "pgd_acc", "lr"])
+
+    def log_epoch(self, epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr):
+        self.rows.append((epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr))
+        with open(self.csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, lr])
+
+    def plot(self, tag: str):
+        if not self.rows:
+            return
+
+        epochs = [r[0] for r in self.rows]
+        train_losses = [r[1] for r in self.rows]
+        train_accs = [r[2] for r in self.rows]
+        test_losses = [r[3] for r in self.rows]
+        test_accs = [r[4] for r in self.rows]
+        pgd_accs = [r[5] for r in self.rows]
+
+        plt.figure()
+        plt.plot(epochs, train_losses, label="train")
+        plt.plot(epochs, test_losses, label="test")
+        plt.xlabel("epoch")
+        plt.ylabel("loss")
+        plt.title(f"Linear Eval Loss ({tag})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.viz_dir, f"lin_loss_{tag}.png"), dpi=150)
+        plt.close()
+
+        plt.figure()
+        plt.plot(epochs, train_accs, label="train")
+        plt.plot(epochs, test_accs, label="test")
+        plt.xlabel("epoch")
+        plt.ylabel("accuracy")
+        plt.title(f"Linear Eval Accuracy ({tag})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.viz_dir, f"lin_acc_{tag}.png"), dpi=150)
+        plt.close()
+
+        plt.figure()
+        plt.plot(epochs, test_accs, label="clean test")
+        plt.plot(epochs, pgd_accs, label="PGD (logged)")
+        plt.xlabel("epoch")
+        plt.ylabel("accuracy")
+        plt.title(f"Robust Accuracy ({tag})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.viz_dir, f"lin_robust_{tag}.png"), dpi=150)
+        plt.close()
+
+
+# -------------------------
+# Linear eval model
 # -------------------------
 class LinearEvalModel(nn.Module):
-    """
-    Wraps the pretrained SimCLR model and trains a linear classifier on top of pooled feature h.
-
-    SimCLR.forward(x) returns: (h_map_small, h, rep)
-    We use h as feature for linear eval.
-
-    Only self.fc is trainable.
-    """
     def __init__(self, simclr_model: nn.Module, feature_dim: int, n_classes: int):
         super().__init__()
         self.simclr = simclr_model
         self.fc = nn.Linear(feature_dim, n_classes)
 
     def forward(self, x):
-        # We only want pooled features h
         _, h, _ = self.simclr(x)
         return self.fc(h)
 
@@ -192,9 +252,8 @@ def run_epoch(model, dataloader, epoch, device, optimizer=None, scheduler=None):
 
     loss_meter = AverageMeter("loss")
     acc_meter = AverageMeter("acc")
-    loader_bar = tqdm(dataloader)
 
-    for x, y in loader_bar:
+    for x, y in tqdm(dataloader, desc=("Train" if is_train else "Test") + f" epoch {epoch}"):
         x = x.to(device, non_blocking=(device == "cuda"))
         y = y.to(device, non_blocking=(device == "cuda"))
 
@@ -202,76 +261,70 @@ def run_epoch(model, dataloader, epoch, device, optimizer=None, scheduler=None):
         loss = F.cross_entropy(logits, y)
 
         if is_train:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
 
         acc = (logits.argmax(dim=1) == y).float().mean()
-
         loss_meter.update(loss.item(), x.size(0))
         acc_meter.update(acc.item(), x.size(0))
 
-        phase = "Train" if is_train else "Test"
-        loader_bar.set_description(
-            f"{phase} epoch {epoch} | loss {loss_meter.avg:.4f} | acc {acc_meter.avg:.4f}"
-        )
-
     return loss_meter.avg, acc_meter.avg
 
-def eval_adv_metrics(model, dataloader, device, attack_cfg):
+
+def eval_adv_metrics(model, dataloader, device, attack_cfg) -> Dict[str, Any]:
     model.eval()
-    eps = float(getattr(attack_cfg, "eps", 8/255))
-    do_fgsm = bool(getattr(attack_cfg, "fgsm", True))
-    do_pgd = bool(getattr(attack_cfg, "pgd", True))
+
+    do_sweep = bool(getattr(attack_cfg, "sweep", False))
+    eps_list = _parse_eps_list(attack_cfg)
+    if not do_sweep:
+        eps_list = [eps_list[-1]]
+
     steps = int(getattr(attack_cfg, "pgd_steps", 10))
-    alpha = float(getattr(attack_cfg, "pgd_alpha", 2/255))
     rs = bool(getattr(attack_cfg, "pgd_random_start", True))
     max_batches = int(getattr(attack_cfg, "max_test_batches", -1))
 
-    clean_correct = 0
-    fgsm_correct = 0
-    pgd_correct = 0
-    n = 0
-
-    pbar = tqdm(dataloader, desc="AdvEval", leave=False)
-    for bidx, (x, y) in enumerate(pbar):
+    # clean
+    clean_correct, n = 0, 0
+    for bidx, (x, y) in enumerate(dataloader):
         if max_batches > 0 and bidx >= max_batches:
             break
-
         x = x.to(device, non_blocking=(device == "cuda"))
         y = y.to(device, non_blocking=(device == "cuda"))
-        bs = x.size(0)
-        n += bs
-
         with torch.no_grad():
             logits = model(x)
             clean_correct += (logits.argmax(1) == y).sum().item()
+        n += x.size(0)
+    out: Dict[str, Any] = {"adv_clean_acc": clean_correct / max(1, n)}
 
-        if do_fgsm:
-            x_f = fgsm_attack(model, x, y, eps=eps)
+    # pgd sweep
+    pgd_acc_by_eps: Dict[float, float] = {}
+    for eps in eps_list:
+        eps = float(eps)
+        alpha = float(getattr(attack_cfg, "pgd_alpha", -1.0))
+        if alpha <= 0:
+            alpha = eps / float(max(1, steps))
+
+        pgd_correct, n_p = 0, 0
+        for bidx, (x, y) in enumerate(dataloader):
+            if max_batches > 0 and bidx >= max_batches:
+                break
+            x = x.to(device, non_blocking=(device == "cuda"))
+            y = y.to(device, non_blocking=(device == "cuda"))
+            x_adv = pgd_attack(model, x, y, eps=eps, alpha=float(alpha), steps=steps, random_start=rs)
             with torch.no_grad():
-                logits_f = model(x_f)
-                fgsm_correct += (logits_f.argmax(1) == y).sum().item()
+                logits = model(x_adv)
+                pgd_correct += (logits.argmax(1) == y).sum().item()
+            n_p += x.size(0)
 
-        if do_pgd:
-            x_p = pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=steps, random_start=rs)
-            with torch.no_grad():
-                logits_p = model(x_p)
-                pgd_correct += (logits_p.argmax(1) == y).sum().item()
+        pgd_acc_by_eps[eps] = pgd_correct / max(1, n_p)
 
-        msg = f"clean {clean_correct/n:.3f}"
-        if do_fgsm:
-            msg += f" | fgsm {fgsm_correct/n:.3f}"
-        if do_pgd:
-            msg += f" | pgd {pgd_correct/n:.3f}"
-        pbar.set_postfix_str(msg)
-
-    out = {"adv_clean_acc": clean_correct / max(1, n)}
-    out["adv_fgsm_acc"] = fgsm_correct / max(1, n) if do_fgsm else float("nan")
-    out["adv_pgd_acc"]  = pgd_correct / max(1, n) if do_pgd else float("nan")
+    out["pgd_acc_by_eps"] = pgd_acc_by_eps
+    out["adv_pgd_acc"] = pgd_acc_by_eps[max(pgd_acc_by_eps.keys())] if pgd_acc_by_eps else float("nan")
     return out
+
 
 @hydra.main(version_base=None, config_path=".", config_name="simclr_config")
 def finetune(args: DictConfig) -> None:
@@ -284,19 +337,23 @@ def finetune(args: DictConfig) -> None:
     )
     print(f"[SimCLR-LIN] using device = {device}")
 
-    # Hydra run dir for outputs
-    out_dir = os.getcwd()
+    orig_cwd = hydra.utils.get_original_cwd()  # repo root
+    run_dir = os.getcwd()                      # hydra run dir (e.g., logs/downstream/.../upE10)
+    print(f"[SimCLR-LIN] hydra run dir = {run_dir}")
 
-    ckpt_dir = os.path.join(out_dir, "checkpoints", "downstream", args.method, f"seed{args.seed}")
-    viz_dir  = os.path.join(out_dir, "visuals",     "downstream", args.method, f"seed{args.seed}")
-    log_dir  = os.path.join(out_dir, "logs",        "downstream", args.method, f"seed{args.seed}")
-    ensure_dir(ckpt_dir)
-    ensure_dir(viz_dir)
-    ensure_dir(log_dir)
+    # outputs inside run dir
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    viz_dir  = os.path.join(run_dir, "visuals")
+    log_dir  = os.path.join(run_dir, "logs")
+    ensure_dir(ckpt_dir); ensure_dir(viz_dir); ensure_dir(log_dir)
 
-    hist = HistoryLogger(log_dir, filename=f"lin_history_{args.method}_{args.backbone}.csv", viz_dir=viz_dir)
+    hist = HistoryLogger(
+        out_dir=log_dir,
+        filename=f"lin_history_{args.method}_{args.backbone}.csv",
+        viz_dir=viz_dir
+    )
 
-    # Simple transforms for linear eval (common practice: light aug on train, standard on test)
+    # dataset
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(32),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -306,12 +363,19 @@ def finetune(args: DictConfig) -> None:
 
     data_dir = hydra.utils.to_absolute_path(args.data_dir)
     train_set = CIFAR10(root=data_dir, train=True, transform=train_transform, download=True)
-    test_set = CIFAR10(root=data_dir, train=False, transform=test_transform, download=True)
+    test_set  = CIFAR10(root=data_dir, train=False, transform=test_transform, download=True)
 
-    # labeled subset: 10 per class (like your original)
+    # labeled subset
     n_classes = 10
-    rng = np.random.default_rng(seed=int(getattr(args, "seed", 0) or 0))
-    indices = rng.choice(len(train_set), 10 * n_classes, replace=False)
+    per_class = int(getattr(args.lin, "per_class", 10))
+    idx_by_class = {c: [] for c in range(n_classes)}
+    for i in range(len(train_set)):
+        _, y = train_set[i]
+        if len(idx_by_class[y]) < per_class:
+            idx_by_class[y].append(i)
+        if all(len(v) >= per_class for v in idx_by_class.values()):
+            break
+    indices = [i for c in range(n_classes) for i in idx_by_class[c]]
     sampler = SubsetRandomSampler(indices)
 
     train_loader = DataLoader(
@@ -328,7 +392,7 @@ def finetune(args: DictConfig) -> None:
         num_workers=int(args.workers),
     )
 
-    # Build the same SimCLR backbone as training
+    # backbone
     assert args.backbone in ["resnet18", "resnet34"]
     base_encoder = resnet18 if args.backbone == "resnet18" else resnet34
 
@@ -337,61 +401,58 @@ def finetune(args: DictConfig) -> None:
         projection_dim=int(args.projection_dim),
         proj_hidden_dim=int(args.model.proj_hidden_dim),
         reduce_channels=int(args.ph.reduce_channels),
-        cifar_no_maxpool=True,  # must match simclr.py
+        cifar_no_maxpool=True,
     ).to(device)
 
-    # Load checkpoint produced by simclr.py
-    ckpt_path = f"checkpoints/upstream/{args.method}/seed{args.seed}/epoch{int(args.load_epoch)}/simclr_{args.method}_{args.backbone}_epoch{int(args.load_epoch)}_seed{int(args.seed)}.pt"
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}\n"
-            f"Make sure you're running from the directory containing the checkpoint, "
-            f"or pass an absolute path / adjust naming."
+    # checkpoint path (robust)
+    ckpt_path = getattr(args, "ckpt_path", None)
+    if ckpt_path is not None:
+        ckpt_path = hydra.utils.to_absolute_path(str(ckpt_path))
+    else:
+        ckpt_path = resolve_upstream_ckpt(
+            orig_cwd=orig_cwd,
+            method=str(args.method),
+            seed=int(args.seed),
+            load_epoch=int(args.load_epoch),
+            backbone=str(args.backbone),
         )
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Upstream checkpoint not found: {ckpt_path}")
 
-    # simclr.py saves ckpt["model"] = model.state_dict()
+    ckpt = torch.load(ckpt_path, map_location=device)
     if isinstance(ckpt, dict) and "model" in ckpt:
         pre_model.load_state_dict(ckpt["model"], strict=True)
     else:
         pre_model.load_state_dict(ckpt, strict=True)
 
-    # Freeze encoder (SimCLR model)
     _set_encoder_eval_and_freeze(pre_model)
 
-    # Linear eval model on pooled features h
-    feature_dim = int(pre_model.feature_dim)  # 512 for resnet18/34
+    feature_dim = int(pre_model.feature_dim)  # 512
     model = LinearEvalModel(pre_model, feature_dim=feature_dim, n_classes=n_classes).to(device)
 
-    # Optimizer only for linear layer
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    lin_lr = 0.1 * float(args.batch_size) / 256.0  # SimCLR paper heuristic
-
+    # optimizer for linear head
+    params = [p for p in model.parameters() if p.requires_grad]
+    lin_lr = 0.1 * float(args.batch_size) / 256.0
     optimizer = torch.optim.SGD(
-        parameters,
+        params,
         lr=lin_lr,
         momentum=float(args.momentum),
         weight_decay=0.0,
         nesterov=True,
     )
 
-    # Cosine annealing LR for finetuning epochs
     finetune_epochs = int(args.finetune_epochs)
     total_steps = finetune_epochs * len(train_loader)
     if total_steps <= 0:
-        raise ValueError(
-            f"Linear eval has 0 training steps. "
-            f"Check labeled subset size vs batch_size. "
-            f"(subset={len(indices)}, batch_size={int(args.batch_size)}, drop_last={False})"
-        )
+        raise ValueError(f"Linear eval has 0 training steps. subset={len(indices)}, batch_size={int(args.batch_size)}")
+
     lr_max = lin_lr
     lr_min = float(args.optim.lr_min)
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda step: get_lr(step, total_steps, lr_max, lr_min) / lr_max)
 
-    scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: get_lr(step, total_steps, lr_max, lr_min) / lr_max
-    )
+    attack_cfg = getattr(args, "attack", None)
+    do_attack = (attack_cfg is not None) and bool(getattr(attack_cfg, "enabled", False))
 
     best_test_acc = 0.0
     best_epoch = 0
@@ -400,25 +461,63 @@ def finetune(args: DictConfig) -> None:
         train_loss, train_acc = run_epoch(model, train_loader, epoch, device, optimizer, scheduler)
         test_loss, test_acc = run_epoch(model, test_loader, epoch, device)
 
-        attack_cfg = getattr(args, "attack", None)
-        pgd_acc = float("nan")
-        if attack_cfg is not None and bool(getattr(attack_cfg, "enabled", False)):
+        pgd_acc_logged = float("nan")
+
+        # run epsilon sweep once at final epoch
+        if do_attack and (epoch == finetune_epochs):
             adv = eval_adv_metrics(model, test_loader, device, attack_cfg)
-            pgd_acc = adv["adv_pgd_acc"]
+            pgd_acc_logged = float(adv["adv_pgd_acc"])
+
+            eps_curve_path = os.path.join(
+                log_dir,
+                f"eps_curve_{args.method}_{args.backbone}_seed{int(args.seed)}_load{int(args.load_epoch)}.json"
+            )
+            payload = {
+                "method": str(args.method),
+                "backbone": str(args.backbone),
+                "seed": int(args.seed),
+                "load_epoch": int(args.load_epoch),
+                "lin_epoch": int(epoch),
+                "attack": {
+                    "sweep": bool(getattr(attack_cfg, "sweep", False)),
+                    "eps_list": sorted([float(e) for e in adv["pgd_acc_by_eps"].keys()]),
+                    "pgd_steps": int(getattr(attack_cfg, "pgd_steps", 10)),
+                    "pgd_alpha": float(getattr(attack_cfg, "pgd_alpha", -1.0)),
+                    "pgd_random_start": bool(getattr(attack_cfg, "pgd_random_start", True)),
+                },
+                "adv_clean_acc": float(adv["adv_clean_acc"]),
+                "pgd_acc_by_eps": {str(float(k)): float(v) for k, v in adv["pgd_acc_by_eps"].items()},
+            }
+            with open(eps_curve_path, "w") as f:
+                json.dump(payload, f, indent=2)
+
+            eps_vals = sorted(adv["pgd_acc_by_eps"].keys())
+            acc_vals = [adv["pgd_acc_by_eps"][e] for e in eps_vals]
+            plt.figure()
+            plt.plot(eps_vals, acc_vals, marker="o")
+            plt.xlabel(r"$\epsilon$ ($\ell_\infty$)")
+            plt.ylabel("PGD robust accuracy")
+            plt.title(f"Epsilon Sweep ({args.method}, seed={args.seed}, up_epoch={int(args.load_epoch)})")
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(viz_dir, f"eps_sweep_{args.method}_seed{int(args.seed)}_load{int(args.load_epoch)}.png"),
+                dpi=150,
+            )
+            plt.close()
 
         current_lr = optimizer.param_groups[0]["lr"]
-        tag = f"{args.method}_{args.backbone}_bs{args.batch_size}_seed{args.seed}"
-
-        hist.log_epoch(epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc, current_lr)
-        hist.plot(tag=tag)
+        tag = f"{args.method}_{args.backbone}_seed{int(args.seed)}_upE{int(args.load_epoch)}"
+        hist.log_epoch(epoch, train_loss, train_acc, test_loss, test_acc, pgd_acc_logged, current_lr)
+        hist.plot(tag)
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
             best_epoch = epoch
-            logger.info("==> New best test acc")
-            best_name = f"simclr_lin_{tag}_best.pth"
-            best_path = os.path.join(ckpt_dir, best_name)
-            torch.save(model.state_dict(), best_path)
+            best_path = os.path.join(ckpt_dir, f"simclr_lin_{tag}_best.pth")
+            try:
+                torch.save(model.state_dict(), best_path)
+            except Exception as e:
+                logger.warning(f"[WARN] Failed to save best linear head: {e}")
 
     logger.info(f"Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")
 

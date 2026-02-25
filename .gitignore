@@ -3,3 +3,5 @@ outputs/
 simclr_hk.py
 data/
 runs/*stream
+log/
+visuals/
