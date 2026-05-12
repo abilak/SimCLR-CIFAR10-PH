@@ -1,136 +1,218 @@
-# Persistent Homology for Adversarial Self-Supervised Learning
+# PHSim: Persistent Homology for Adversarial Self-Supervised Learning
 
-This repository implements **PHSim**, a topology-aware adversarial contrastive learning framework that integrates persistent homology into self-supervised representation learning.
+This repository implements **PHSim**, a topology-aware self-supervised learning method that integrates persistent homology into SimCLR-style contrastive representation learning.
 
-We empirically validate the central claim of our paper:
+The project empirically studies the central claim of the paper:
 
-> Adversarially stable multiscale topological separation upstream constrains downstream adversarial supervised risk.
+> **Adversarially stable multiscale topological separation in upstream self-supervised representations is associated with improved downstream adversarial robustness.**
 
+PHSim is evaluated on CIFAR-10 using a ResNet-18 encoder, frozen linear probing, and PGD adversarial evaluation.
 
-## Objective
+---
 
-Adversarial contrastive learning theory shows that downstream adversarial supervised risk is controlled by upstream adversarial unsupervised separation.
+## 1. Problem Setting
 
-Instead of measuring separation using cosine similarity or margins, we define a **persistent-homology-based separation functional**:
+### CIFAR-10 task
 
-Gamma(f, x) = sliced-Wasserstein distance between
-PD(Z⁺(x)) and PD(Z⁻(x))
+CIFAR-10 is a 10-class image classification dataset. The downstream supervised task is to classify each image into one of the following classes:
 
-where:
+`airplane`, `automobile`, `bird`, `cat`, `deer`, `dog`, `frog`, `horse`, `ship`, `truck`.
 
-* Z⁺(x) = positive embedding neighborhood
-* Z⁻(x) = negative embedding neighborhood
-* PD(·) = persistence diagram (Vietoris–Rips filtration)
+### Two-phase SSL evaluation protocol
 
-Our goal is to test:
+We follow the standard self-supervised learning pipeline.
 
-* Does adversarial persistent separation correlate with downstream robustness?
-* Does enforcing persistent homology separation improve robustness?
-* How does robustness evolve over training?
+| Phase | Description | Labels used? |
+|---|---|---|
+| **Upstream pretraining** | Train an encoder with SimCLR-style contrastive learning or PHSim. | No |
+| **Downstream linear probing** | Freeze the encoder and train a linear classifier on CIFAR-10 labels. | Yes |
 
+The goal is not only to maximize clean CIFAR-10 accuracy, but to test whether the upstream representation structure improves **downstream adversarial robustness**.
 
-## Setup
+---
 
-Dataset: CIFAR-10
-Backbone: ResNet-18
-Pretraining: SimCLR-style contrastive learning
+## 2. Positive and Negative Samples
 
-Methods:
+In upstream SimCLR-style training, labels are not used. Positive and negative pairs are constructed from data augmentations.
 
-* `baseline` — standard SimCLR
-* `phsim` — persistent-homology-guided contrastive learning
+For an anchor image `x`:
 
-Downstream task: linear probing (frozen encoder)
+- A **positive sample** is another augmented view of the same original image.
+- A **negative sample** is an augmented view of a different image in the batch.
 
-Adversarial evaluation:
+Example:
 
-* PGD-10
-* ℓ∞ threat model
-* epsilon in {0, 2, 4, 6, 8, 10}/255
-
-
-## Experiments
-
-We conduct three complementary experimental studies.
-
-
-### 1) Upstream Adversarial Topological Separation vs Downstream Robustness
-
-We measure adversarial persistent separation:
-
-Gamma_adv(f, x) = max over x' in epsilon-ball of Gamma(f, x')
-
-and correlate it with downstream PGD robust accuracy across upstream checkpoints.
-
-Spearman correlation results:
-
-| Method   | Spearman(Gamma_adv, PGD) |
-| -------- | ------------------------ |
-| Baseline | -0.0494                  |
-| PHSim    | **0.1572**               |
-
-Interpretation:
-
-* Baseline: no monotonic relationship.
-* PHSim: positive monotonic structure.
-* Larger adversarial persistent separation corresponds to higher downstream robustness.
-
-This supports the topology-to-downstream control mechanism predicted by theory.
-
-### 2) Clean Accuracy vs Robustness Dynamics
-
-We compare clean accuracy and PGD robustness across upstream epochs.
-
-Observations:
-
-* Early epochs: PHSim prioritizes robustness.
-* Later epochs: baseline may slightly outperform in clean accuracy.
-* Robustness improvements are most pronounced during early representation formation.
-
-This suggests a structural trade-off between:
-
-* Geometric alignment (baseline)
-* Multiscale topological separation (PHSim)
-
-### 3) Robustness Across Epsilon
-
-We evaluate PGD-10 robustness across epsilon ∈ {0,2,4,6,8,10}/255.
-
-Metrics:
-
-* Robust accuracy curves
-* Area Under Curve (AUC)
-
-Early training (epoch 10):
-
-* PHSim achieves ~7× higher PGD@8/255 robustness
-  (0.0559 vs 0.0081)
-* Larger robustness AUC
-
-Later training (epoch 30):
-
-* Baseline narrows the gap
-* Clean accuracy improves
-* Robustness becomes comparable
-
-Interpretation:
-
-PHSim accelerates early robustness formation by shaping representation topology.
-
-Robustness curves degrade smoothly across epsilon without abrupt jumps, indicating stability under increasing attack strength.
-
-
-## Key Findings
-
-* Persistent separation correlates with downstream adversarial robustness.
-* Enforcing persistent homology separation improves early-stage robustness.
-* Topological regularization stabilizes representations under perturbations.
-* Robustness gains are monotonic in adversarial persistent separation.
-
-
-## Repository Structure
-
+```text
+anchor:      crop/color-jitter of image A
+positive:    another augmented view of image A
+negatives:   augmented views of images B, C, D, ...
 ```
+
+Standard SimCLR uses pairwise cosine similarity between embeddings. PHSim instead compares the **topological structure** of positive and negative embedding neighborhoods.
+
+---
+
+## 3. Persistent Separation Score Gamma
+
+For an encoder `f` and anchor image `x`, PHSim forms two embedding neighborhoods:
+
+```math
+Z^+(x) = \{ f(x_i^+) \}_{i=1}^k,
+\qquad
+Z^-(x) = \{ f(x_i^-) \}_{i=1}^k.
+```
+
+Here:
+
+- `Z⁺(x)` is the positive embedding neighborhood.
+- `Z⁻(x)` is the negative embedding neighborhood.
+
+We compute Vietoris--Rips persistence diagrams for both neighborhoods:
+
+```math
+PD(Z^+(x)),
+\qquad
+PD(Z^-(x)).
+```
+
+The persistent separation score is
+
+```math
+\Gamma(f;x)
+=
+d_{\mathrm{SW}}\left(PD(Z^+(x)), PD(Z^-(x))\right),
+```
+
+where `d_SW` is the sliced-Wasserstein distance between persistence diagrams.
+
+### Interpretation
+
+- **Small Gamma**: positive and negative neighborhoods have similar multiscale topology.
+- **Large Gamma**: positive and negative neighborhoods are more topologically separated.
+
+A large Gamma means the representation is not only separating samples by local pairwise distance, but also organizing positive and negative neighborhoods into more distinct multiscale structures.
+
+We also evaluate the adversarial version:
+
+```math
+\Gamma_{\mathrm{adv}}(f;x)
+=
+\sup_{x' \in U_\epsilon(x)} \Gamma(f;x'),
+```
+
+where `U_epsilon(x)` is the allowed adversarial perturbation set.
+
+---
+
+## 4. Methods Compared
+
+| Method | Description |
+|---|---|
+| `baseline` | Standard SimCLR / NT-Xent contrastive learning. |
+| `phsim` | Persistent-homology-guided contrastive learning using sliced-Wasserstein separation between persistence diagrams. |
+
+Both methods use the same CIFAR-10 data, ResNet-18 backbone, downstream linear probing protocol, and adversarial evaluation setup.
+
+---
+
+## 5. Experimental Setup
+
+| Component | Setting |
+|---|---|
+| Dataset | CIFAR-10 |
+| Encoder | ResNet-18 |
+| Upstream training | SimCLR-style self-supervised pretraining |
+| Downstream task | Frozen encoder + linear classifier |
+| Clean metric | Standard CIFAR-10 accuracy |
+| Robust metric | PGD robust accuracy |
+| Attack | PGD-10 |
+| Threat model | `l_inf` |
+| Epsilon sweep | `{0, 2, 4, 6, 8, 10}/255` |
+
+---
+
+## 6. Experiments and Results
+
+### Experiment 1: Adversarial Gamma vs. Downstream Robustness
+
+**Goal.** Test whether adversarial persistent separation is aligned with downstream PGD robustness.
+
+We compute `Gamma_adv` across upstream checkpoints and correlate it with downstream PGD robust accuracy.
+
+| Method | Spearman(`Gamma_adv`, PGD accuracy) |
+|---|---:|
+| Baseline | -0.0494 |
+| PHSim | **0.1572** |
+
+**Takeaway.** Baseline shows essentially no monotonic relationship. PHSim shows positive monotonic alignment: larger adversarial persistent separation tends to correspond to better downstream PGD robustness.
+
+This supports the paper's topology-to-downstream mechanism, but should be interpreted carefully as empirical alignment rather than a strong pointwise prediction law.
+
+---
+
+### Experiment 2: Persistent Separation and Downstream Performance
+
+**Goal.** Test whether PHSim shifts representations into a higher-Gamma regime and whether that regime is associated with better robustness.
+
+At best-clean checkpoints across runs, we compare mean Gamma, clean accuracy, and PGD robust accuracy.
+
+| Method | Mean Gamma | Mean Clean Accuracy | Mean PGD Accuracy |
+|---|---:|---:|---:|
+| Baseline | 36.41 | 0.455 | 0.149 |
+| PHSim | **37.58** | 0.387 | **0.196** |
+
+**Takeaway.** PHSim increases mean persistent separation by about `+1.17` and improves PGD robust accuracy by about 31% relative to baseline.
+
+However, PHSim does not improve clean accuracy. This suggests that PHSim's advantage is robustness-specific rather than a generic accuracy gain.
+
+Important nuance: pooled Pearson correlations between Gamma and accuracy are weak, so Gamma should not be presented as a simple linear predictor of accuracy. The stronger claim is that PHSim induces a higher-Gamma, robustness-relevant representation regime.
+
+---
+
+### Experiment 3: Robustness Across Attack Strengths
+
+**Goal.** Test whether PHSim remains robust as the PGD attack strength increases.
+
+We evaluate PGD-10 robust accuracy across
+
+```math
+\epsilon \in \{0,2,4,6,8,10\}/255.
+```
+
+We report robustness curves and area under the curve (AUC).
+
+At upstream epoch 10:
+
+| Method | PGD Accuracy at `8/255` |
+|---|---:|
+| Baseline | 0.0081 |
+| PHSim | **0.0559** |
+
+**Takeaway.** At epoch 10, PHSim achieves roughly `7x` higher PGD robustness at `8/255` and a larger robustness AUC.
+
+At later epochs, the baseline narrows the gap, suggesting that PHSim mainly accelerates early robustness formation by shaping representation topology.
+
+---
+
+## 7. Main Findings
+
+1. **PHSim produces higher persistent separation.**
+   PHSim has higher mean Gamma than baseline at evaluated checkpoints.
+
+2. **PHSim improves downstream PGD robustness.**
+   PHSim improves robust accuracy despite lower clean accuracy.
+
+3. **The robustness gain is strongest early in training.**
+   At epoch 10, PHSim substantially outperforms baseline under PGD attacks.
+
+4. **Gamma is a structural signal, not a standalone accuracy predictor.**
+   Gamma is useful for understanding representation topology, but it should not be overclaimed as a simple linear predictor of clean or robust accuracy.
+
+---
+
+## 8. Repository Structure
+
+```text
 SIMCLR-CIFAR10-PH/
 
 ├── data/
@@ -176,26 +258,32 @@ SIMCLR-CIFAR10-PH/
 │       └── merge_and_plot_gamma_pgd.py
 │
 ├── visuals/
-│
-├── simclr.py                  # upstream training
-├── simclr_lin.py              # downstream linear probing
-├── models.py                  # backbone + projection heads
-├── simclr_config.yaml         # Hydra config
+├── simclr.py              # upstream pretraining
+├── simclr_lin.py          # downstream linear probing and PGD evaluation
+├── models.py              # ResNet backbone and projection heads
+├── simclr_config.yaml     # Hydra configuration
 ├── requirements.txt
 ├── README.md
 └── .gitignore
 ```
 
+---
 
-## Running Experiments
+## 9. Running Experiments
 
-Upstream pretraining:
+### Upstream pretraining
 
 ```bash
 python simclr.py backbone=resnet18 method=phsim seed=0
 ```
 
-Downstream linear probe:
+For the baseline:
+
+```bash
+python simclr.py backbone=resnet18 method=baseline seed=0
+```
+
+### Downstream linear probing with PGD evaluation
 
 ```bash
 python simclr_lin.py \
@@ -206,11 +294,44 @@ python simclr_lin.py \
   attack.pgd=true
 ```
 
+### Epsilon sweep
 
-## Summary
+Use the scripts under:
 
-This repository provides empirical evidence that:
+```text
+utils/eps_robustness/
+```
 
-Adversarially stable multiscale topological separation upstream constrains downstream adversarial supervised risk.
+Expected outputs include robustness curves and merged CSV files under:
 
-Persistent homology is not merely descriptive — it provides a structural mechanism for adversarial robustness.
+```text
+output/eps_robustness/
+```
+
+### Gamma analysis
+
+Use the scripts under:
+
+```text
+utils/gamma_adv_vs_pgd/
+utils/gamma_vs_pgd/
+```
+
+Expected outputs include Gamma-vs-PGD scatter plots, Gamma-vs-clean plots, and summary tables under:
+
+```text
+output/gamma_adv_vs_pgd/
+output/gamma_vs_acc/
+```
+
+---
+
+## 10. Summary
+
+PHSim provides an empirical testbed for the idea that persistent-homology structure in self-supervised representations is relevant to adversarial robustness.
+
+The key experimental conclusion is:
+
+> PHSim shifts representations toward a higher persistent-separation regime and improves downstream PGD robustness, especially during early training.
+
+At the same time, Gamma should be interpreted as a structural representation metric rather than a direct accuracy predictor.
