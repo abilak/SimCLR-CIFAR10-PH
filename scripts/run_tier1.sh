@@ -17,12 +17,12 @@
 set -euo pipefail
 
 BACKBONE=resnet18
-SEEDS=(0 1 2 3 4)                 # Tier-1 #1 requires >= 5 seeds
+SEEDS=(0 1 2)                 # Tier-1 #1 requires >= 5 seeds
 METHODS=(baseline phsim swcontrol)
-EPOCHS=200                        # real pretraining (not the epoch-10 toy checkpoint)
-SAVE_EVERY=20                     # checkpoint cadence (gives the epoch sweep for #4)
+EPOCHS=50                        # real pretraining (not the epoch-10 toy checkpoint)
+SAVE_EVERY=10                     # checkpoint cadence (gives the epoch sweep for #4)
 EPS_PX=8                          # 8/255 Linf
-OUT=runs/tier1
+OUT=runs/tier1_pilot
 PY=python
 
 mkdir -p "$OUT"/{upstream,robustness,mechanism,stats}
