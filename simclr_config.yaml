@@ -5,6 +5,9 @@
 
 data_dir: ./data
 
+# device: auto | cuda | mps | cpu  (auto picks cuda>mps>cpu)
+device: auto
+
 # backbone: resnet18 | resnet34
 backbone: resnet18
 

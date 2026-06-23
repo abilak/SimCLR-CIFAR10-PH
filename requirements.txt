@@ -1,10 +1,23 @@
-torch>=1.2
-torchvision>=0.4.0
-hydra-core>=0.11.3
-tqdm>=4.45.0
-matplotlib
-ripser
-torchph
-ninja
-pandas
+# Core
+torch>=2.0
+torchvision>=0.15
 numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+tqdm
+Pillow
+
+# Config
+hydra-core>=1.3
+omegaconf>=2.3
+
+# Topological data analysis
+gudhi>=3.8            # fast C++ Vietoris-Rips for H0/H1 eval diagnostics
+# (Differentiable H0 + sliced-Wasserstein are pure-PyTorch in phtopo/, no TDA dep.)
+# NOTE: ripser / persim / torchph are NO LONGER used (removed: CPU-only & non-differentiable).
+
+# Robustness evaluation (Tier-1 #1) -- install on the run machine for AutoAttack:
+#   pip install git+https://github.com/fra31/auto-attack
+autoattack @ git+https://github.com/fra31/auto-attack.git

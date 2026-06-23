@@ -14,7 +14,6 @@ Run examples:
 
 import os
 import csv
-import itertools
 import logging
 import warnings
 from typing import Optional
@@ -27,9 +26,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from persim import wasserstein
 from PIL import Image
-from ripser import ripser
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
@@ -38,6 +35,8 @@ from torchvision.models import resnet18, resnet34
 from tqdm import tqdm
 
 from models import SimCLR
+from phtopo.losses import topo_separation_loss, raw_sw_separation_loss
+from phtopo.descriptors import class_separation_gamma
 
 logger = logging.getLogger(__name__)
 warnings.simplefilter("ignore", UserWarning)
@@ -124,28 +123,6 @@ class HistoryLogger:
         plt.close()
 
 
-def _sanitize_dgm_np(dgm: np.ndarray) -> np.ndarray:
-    """Keep only finite off-diagonal points with positive persistence."""
-    if dgm is None or dgm.size == 0:
-        return np.zeros((0, 2), dtype=np.float32)
-    dgm = dgm.astype(np.float32, copy=False)
-    mask = np.isfinite(dgm).all(axis=1)
-    dgm = dgm[mask]
-    if dgm.size == 0:
-        return np.zeros((0, 2), dtype=np.float32)
-    pers = dgm[:, 1] - dgm[:, 0]
-    dgm = dgm[pers > 1e-8]
-    if dgm.size == 0:
-        return np.zeros((0, 2), dtype=np.float32)
-    return dgm
-
-
-def _standardize_np(x: np.ndarray) -> np.ndarray:
-    x = x - x.mean(axis=0, keepdims=True)
-    x = x / (x.std(axis=0, keepdims=True) + 1e-6)
-    return x.astype(np.float32)
-
-
 @torch.no_grad()
 def eval_gamma_class_separation(
     model: nn.Module,
@@ -189,24 +166,11 @@ def eval_gamma_class_separation(
         for i, c in enumerate(y):
             feats[int(c)].append(h_np[i])
 
-    dgms0, dgms1 = {}, {}
-    for c in range(10):
-        Xc = np.stack(feats[c], axis=0)
-        Xc = _standardize_np(Xc)
-        dgms = ripser(Xc, maxdim=maxdim)["dgms"]
-        d0 = _sanitize_dgm_np(dgms[0])
-        d1 = _sanitize_dgm_np(dgms[1]) if len(dgms) > 1 else np.zeros((0, 2), dtype=np.float32)
-        dgms0[c] = d0
-        dgms1[c] = d1
-
-    dists = []
-    for a, b in itertools.combinations(range(10), 2):
-        d0 = wasserstein(dgms0[a], dgms0[b], matching=False)
-        d1 = wasserstein(dgms1[a], dgms1[b], matching=False)
-        d = float(w_h0) * float(d0) + float(w_h1) * float(d1)
-        dists.append(d)
-
-    return float(np.mean(dists)) if dists else 0.0
+    feats_by_class = {c: np.stack(feats[c], axis=0) for c in range(10) if len(feats[c]) > 0}
+    # Fast GUDHI (H0/H1) + sliced-Wasserstein; same SW functional as training.
+    return class_separation_gamma(
+        feats_by_class, w_h0=float(w_h0), w_h1=float(w_h1), maxdim=maxdim
+    )
 
 
 def set_seed(seed: int):
@@ -243,84 +207,6 @@ class CIFAR10Pair(CIFAR10):
 
 
 # -------------------------
-# PH featurizer (ripser CPU; detached)
-# -------------------------
-class PHDiagramFeaturizer(nn.Module):
-    """
-    feature map -> point cloud -> ripser diagrams (H0/H1)
-    Returns diagrams only (no vectorization).
-    """
-    def __init__(self, num_points=25, max_pts_per_dgm=64):
-        super().__init__()
-        self.num_points = int(num_points) if num_points is not None else None
-        self.max_pts_per_dgm = int(max_pts_per_dgm)
-
-    def _to_pointcloud(self, h_map_small: torch.Tensor) -> torch.Tensor:
-        # (B,C,H,W) -> (B,N,C)
-        B, C, H, W = h_map_small.shape
-        pts = h_map_small.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        N = H * W
-        if self.num_points is not None and self.num_points < N:
-            idx = torch.linspace(0, N - 1, steps=self.num_points, device=h_map_small.device).long()
-            pts = pts[:, idx, :]
-        return pts
-
-    @staticmethod
-    def _standardize_np(x: np.ndarray) -> np.ndarray:
-        x = x - x.mean(axis=0, keepdims=True)
-        x = x / (x.std(axis=0, keepdims=True) + 1e-6)
-        return x.astype(np.float32)
-
-    @staticmethod
-    def _sanitize_dgm_np(dgm: np.ndarray) -> np.ndarray:
-        """Keep only finite points with death > birth."""
-        if dgm is None or dgm.size == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        dgm = dgm.astype(np.float32, copy=False)
-        mask = np.isfinite(dgm).all(axis=1)
-        dgm = dgm[mask]
-        if dgm.size == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        pers = dgm[:, 1] - dgm[:, 0]
-        dgm = dgm[pers > 1e-8]
-        if dgm.size == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        return dgm
-
-    def _cap_points(self, dgm: np.ndarray) -> np.ndarray:
-        """Keep top-K points by persistence to reduce Wasserstein cost."""
-        if dgm.shape[0] <= self.max_pts_per_dgm:
-            return dgm
-        pers = dgm[:, 1] - dgm[:, 0]
-        idx = np.argsort(-pers)[: self.max_pts_per_dgm]
-        return dgm[idx]
-
-    def _vr_persistence_np(self, pts: torch.Tensor, hom_dim: int) -> np.ndarray:
-        pts_np = pts.detach().cpu().numpy().astype(np.float32, copy=False)
-        pts_np = self._standardize_np(pts_np)
-
-        dgms = ripser(pts_np, maxdim=1)["dgms"]
-        dgm = dgms[hom_dim]
-        dgm = self._sanitize_dgm_np(dgm)
-        dgm = self._cap_points(dgm)
-        return dgm
-
-    def forward(self, h_map_small: torch.Tensor):
-        """
-        Returns:
-          dgms0: list length B, each is (n_i,2) np.ndarray for H0
-          dgms1: list length B, each is (m_i,2) np.ndarray for H1
-        """
-        pts_batch = self._to_pointcloud(h_map_small)  # (B,N,C)
-        dgms0, dgms1 = [], []
-        for b in range(pts_batch.size(0)):
-            pts = pts_batch[b]  # (N,C)
-            dgms0.append(self._vr_persistence_np(pts, hom_dim=0))
-            dgms1.append(self._vr_persistence_np(pts, hom_dim=1))
-        return dgms0, dgms1
-
-
-# -------------------------
 # Losses
 # -------------------------
 def nt_xent(x: torch.Tensor, t=0.5) -> torch.Tensor:
@@ -335,49 +221,9 @@ def nt_xent(x: torch.Tensor, t=0.5) -> torch.Tensor:
     return F.cross_entropy(sim, targets.long())
 
 
-import random
-
-def ph_rank_loss(
-    rep: torch.Tensor,
-    dgms0,
-    dgms1,
-    tau_student: float,
-    neg_k: int = 2,
-    w_h0: float = 0.0,
-    w_h1: float = 1.0,
-    margin: float = 0.2,
-) -> torch.Tensor:
-    """
-    Ranking hinge loss:
-      choose a few random negatives; teacher picks the "hardest" negative (min PH distance).
-      encourage s_pos >= s_neg + margin
-    """
-    N = rep.size(0)
-    rep_n = rep / (rep.norm(dim=1, keepdim=True) + 1e-8)
-    all_idx = list(range(N))
-    losses = []
-
-    for i in range(N):
-        j_pos = i + 1 if (i % 2 == 0) else i - 1
-        forbidden = {i, j_pos}
-        candidates = [j for j in all_idx if j not in forbidden]
-        negs = random.sample(candidates, k=min(neg_k, len(candidates)))
-
-        s_pos = (rep_n[i] * rep_n[j_pos]).sum()
-        s_negs = torch.stack([(rep_n[i] * rep_n[j]).sum() for j in negs])
-
-        d_negs = []
-        for j in negs:
-            d0 = wasserstein(dgms0[i], dgms0[j], matching=False) if w_h0 != 0.0 else 0.0
-            d1 = wasserstein(dgms1[i], dgms1[j], matching=False) if w_h1 != 0.0 else 0.0
-            d_negs.append(float(w_h0) * float(d0) + float(w_h1) * float(d1))
-
-        j_hard = int(np.argmin(np.array(d_negs, dtype=np.float32)))
-        s_neg = s_negs[j_hard]
-
-        losses.append(F.relu(margin - (s_pos - s_neg)))
-
-    return torch.stack(losses).mean()
+# Differentiable persistent-separation objectives live in phtopo.losses:
+#   topo_separation_loss   -> method=phsim   (gradient flows through topology)
+#   raw_sw_separation_loss -> method=swcontrol (non-topological control, Tier-1 #2)
 
 
 # -------------------------
@@ -387,11 +233,15 @@ def ph_rank_loss(
 def train(args: DictConfig) -> None:
     logger.info("Config:\n" + OmegaConf.to_yaml(args))
 
-    device = (
-        "cuda" if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    device_cfg = str(getattr(args, "device", "auto")).lower()
+    if device_cfg in ("cuda", "mps", "cpu"):
+        device = device_cfg
+    else:
+        device = (
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
     print(f"[SimCLR] using device = {device}")
     if device == "cuda":
         cudnn.benchmark = True
@@ -447,11 +297,6 @@ def train(args: DictConfig) -> None:
         cifar_no_maxpool=True,  # IMPORTANT for PH on CIFAR
     ).to(device)
 
-    ph_featurizer = PHDiagramFeaturizer(
-        num_points=int(args.ph.num_points),
-        max_pts_per_dgm=int(getattr(args.ph, "max_pts_per_dgm", 64)),
-    ).to(device)
-
     logger.info(f"Base model: {args.backbone}")
     logger.info(f"feature dim: {model.feature_dim}, projection dim: {args.projection_dim}")
     logger.info(f"method: {args.method}")
@@ -480,10 +325,16 @@ def train(args: DictConfig) -> None:
     scheduler = LambdaLR(optimizer, lr_lambda=lr_mult)
 
     model.train()
-    ph_featurizer.train()
 
     temperature = float(args.temperature)
     tau_student = float(args.loss.student_temperature)
+
+    # PH loss hyperparameters (differentiable separation objective)
+    ph_num_points = int(getattr(args.ph, "num_points", 25))
+    ph_neg_k = int(getattr(args.ph, "neg_k", 4))
+    ph_margin = float(getattr(args.ph, "margin", 1.0))
+    ph_ndir = int(getattr(args.ph, "n_directions", 32))
+    ph_lambda = float(getattr(args.ph, "ph_lambda", 1.0))  # weight when combined with nt_xent
 
     warmup_epochs = int(getattr(args.train, "warmup_epochs", 0))
 
@@ -525,44 +376,41 @@ def train(args: DictConfig) -> None:
             h_map_small, _, rep = model(x)
 
             method = str(args.method).lower()
-            if method in ["phsim", "hybrid"] and warmup_epochs > 0 and epoch <= warmup_epochs:
+            ph_methods = ["phsim", "swcontrol", "hybrid"]
+            if method in ph_methods and warmup_epochs > 0 and epoch <= warmup_epochs:
                 method_eff = "baseline"
             else:
                 method_eff = method
 
+            sep_fn = topo_separation_loss if method_eff != "swcontrol" else raw_sw_separation_loss
+
             if method_eff == "baseline":
                 loss = nt_xent(rep, temperature)
 
-            elif method_eff == "phsim":
-                dgms0, dgms1 = ph_featurizer(h_map_small)
-                loss = ph_rank_loss(
-                    rep=rep,
-                    dgms0=dgms0,
-                    dgms1=dgms1,
-                    tau_student=tau_student,
-                    neg_k=int(getattr(args.ph, "neg_k", 2)),
-                    w_h0=float(getattr(args.ph, "w_h0", 0.0)),
-                    w_h1=float(getattr(args.ph, "w_h1", 1.0)),
+            elif method_eff in ("phsim", "swcontrol"):
+                # Differentiable persistent-separation (or non-topological control)
+                loss, _ = sep_fn(
+                    h_map_small,
+                    num_points=ph_num_points,
+                    neg_k=ph_neg_k,
+                    margin=ph_margin,
+                    n_directions=ph_ndir,
                 )
 
             elif method_eff == "hybrid":
                 alpha = float(args.loss.alpha)
                 loss_cos = nt_xent(rep, temperature)
-
-                dgms0, dgms1 = ph_featurizer(h_map_small)
-                loss_ph = ph_rank_loss(
-                    rep=rep,
-                    dgms0=dgms0,
-                    dgms1=dgms1,
-                    tau_student=tau_student,
-                    neg_k=int(getattr(args.ph, "neg_k", 2)),
-                    w_h0=float(getattr(args.ph, "w_h0", 0.0)),
-                    w_h1=float(getattr(args.ph, "w_h1", 1.0)),
+                loss_ph, _ = topo_separation_loss(
+                    h_map_small,
+                    num_points=ph_num_points,
+                    neg_k=ph_neg_k,
+                    margin=ph_margin,
+                    n_directions=ph_ndir,
                 )
-                loss = alpha * loss_cos + (1.0 - alpha) * loss_ph
+                loss = alpha * loss_cos + (1.0 - alpha) * ph_lambda * loss_ph
 
             else:
-                raise ValueError(f"Unknown method={args.method}. Use baseline|phsim|hybrid.")
+                raise ValueError(f"Unknown method={args.method}. Use baseline|phsim|swcontrol|hybrid.")
 
             loss.backward()
             optimizer.step()
@@ -577,7 +425,6 @@ def train(args: DictConfig) -> None:
         if epoch % save_every == 0:
             ckpt = {
                 "model": model.state_dict(),
-                "ph_featurizer": ph_featurizer.state_dict(),
                 "config": OmegaConf.to_container(args, resolve=True),
                 "epoch": epoch,
             }
@@ -609,7 +456,6 @@ def train(args: DictConfig) -> None:
                 maxdim=1,
             )
             model.train()
-            ph_featurizer.train()
 
         hist.log_epoch(epoch, loss_meter.avg, current_lr, gamma)
 
@@ -637,8 +483,7 @@ def train(args: DictConfig) -> None:
                 torch.save(
                     {
                         "model": model.state_dict(),
-                        "ph_featurizer": ph_featurizer.state_dict(),
-                        "config": OmegaConf.to_container(args, resolve=True),
+                                "config": OmegaConf.to_container(args, resolve=True),
                         "best_gamma": best_gamma,
                         "best_epoch": best_epoch,
                     },
@@ -650,8 +495,7 @@ def train(args: DictConfig) -> None:
                 if epoch % save_every != 0:
                     ckpt = {
                         "model": model.state_dict(),
-                        "ph_featurizer": ph_featurizer.state_dict(),
-                        "config": OmegaConf.to_container(args, resolve=True),
+                                "config": OmegaConf.to_container(args, resolve=True),
                         "epoch": epoch,
                         "best_gamma": best_gamma,
                         "best_epoch": best_epoch,

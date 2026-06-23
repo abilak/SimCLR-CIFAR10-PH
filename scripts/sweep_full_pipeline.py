@@ -404,6 +404,7 @@ def main():
                 f"attack.max_test_batches={args.max_test_batches}",
                 f"hydra.run.dir={run_dir.as_posix()}",
                 "hydra.output_subdir=.hydra",
+                "hydra.job.chdir=true",  # Hydra >=1.2 defaults chdir off; needed for per-run isolation
             ]
             run(cmd, dry_run=args.dry_run)
 

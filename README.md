@@ -8,6 +8,16 @@ The project empirically studies the central claim of the paper:
 
 PHSim is evaluated on CIFAR-10 using a ResNet-18 encoder, frozen linear probing, and PGD adversarial evaluation.
 
+> **⚠️ Experimental rebuild (Tier-1).** The original PH path was CPU-only and
+> *non-differentiable* (diagrams detached via `ripser`/`persim`), so gradients
+> never flowed through the topology and PHSim did not actually control Γ. It has
+> been replaced by [`phtopo/`](phtopo/), a **differentiable, batched, GPU-ready**
+> PH toolkit, and the experiments were rebuilt to address the four reviewer-critical
+> concerns (real AutoAttack robustness + gradient-masking diagnostics,
+> topology-specificity controls, a topology-under-attack mechanism test, and honest
+> correlation statistics). See **[EXPERIMENTS_TIER1.md](EXPERIMENTS_TIER1.md)** and
+> run with `bash scripts/run_tier1.sh`. Methods now: `baseline | phsim | swcontrol | hybrid`.
+
 ---
 
 ## 1. Problem Setting

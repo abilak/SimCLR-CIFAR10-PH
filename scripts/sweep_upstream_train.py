@@ -84,6 +84,7 @@ def main():
             f"train.max_steps={max_steps}",
             f"hydra.run.dir={run_dir.as_posix()}",
             "hydra.output_subdir=.hydra",
+            "hydra.job.chdir=true",  # Hydra >=1.2 defaults chdir off; needed for per-run isolation
         ]
         run(cmd, dry_run=args.dry_run)
 
