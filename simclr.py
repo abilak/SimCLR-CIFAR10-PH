@@ -35,7 +35,11 @@ from torchvision.models import resnet18, resnet34
 from tqdm import tqdm
 
 from models import SimCLR
-from phtopo.losses import topo_separation_loss, raw_sw_separation_loss
+from phtopo.losses import (
+    topo_separation_loss, raw_sw_separation_loss,
+    topo_consistency_loss, raw_consistency_loss,
+)
+from phtopo.adv import pgd_ascent_on_loss, eval_mode
 from phtopo.descriptors import class_separation_gamma
 
 logger = logging.getLogger(__name__)
@@ -226,6 +230,139 @@ def nt_xent(x: torch.Tensor, t=0.5) -> torch.Tensor:
 #   raw_sw_separation_loss -> method=swcontrol (non-topological control, Tier-1 #2)
 
 
+# Method taxonomy
+CLEAN_METHODS = {"baseline", "phsim", "swcontrol", "hybrid"}
+ADV_WRAP_METHODS = {"adv_baseline", "adv_phsim", "adv_swcontrol"}  # adversarial SSL (ACL-style)
+CONSIST_METHODS = {"topoacl", "rawacl"}                            # clean NT-Xent + adv consistency
+ALL_METHODS = CLEAN_METHODS | ADV_WRAP_METHODS | CONSIST_METHODS
+
+
+def _ph_forward(model, x, P):
+    """Return (maps, rep): a LIST of PH feature maps (>1 if multiscale) + projection."""
+    if P.get("multiscale"):
+        maps, _, rep = model.ph_maps(x)
+        return maps, rep
+    h_map, _, rep = model(x)
+    return [h_map], rep
+
+
+def _sep_loss_maps(core, maps, P):
+    """Mean separation loss over the (multiscale) list of maps. Returns (loss, stats)."""
+    fn = topo_separation_loss if core == "phsim" else raw_sw_separation_loss
+    losses, st = [], {}
+    for hm in maps:
+        l, st = fn(hm, num_points=P["num_points"], neg_k=P["neg_k"], margin=P["margin"],
+                   n_directions=P["ndir"], neg_agg=P["neg_agg"], softmin_temp=P["softmin_temp"])
+        losses.append(l)
+    return torch.stack(losses).mean(), st
+
+
+def _consistency_maps(method, maps_clean, maps_adv, P):
+    """Mean clean-vs-adv consistency over the (multiscale) list of map pairs."""
+    assert len(maps_clean) == len(maps_adv), \
+        f"multiscale map count mismatch: {len(maps_clean)} vs {len(maps_adv)}"
+    cons_fn = topo_consistency_loss if method == "topoacl" else raw_consistency_loss
+    losses, st = [], {}
+    for hc, ha in zip(maps_clean, maps_adv):
+        l, st = cons_fn(hc, ha, num_points=P["num_points"], n_directions=P["ndir"])
+        losses.append(l)
+    return torch.stack(losses).mean(), st
+
+
+def compute_training_loss(model, x, method, P, teacher_model=None):
+    """
+    Compute the upstream training loss for a batch x (2B interleaved views) under
+    any supported method, with optional multiscale PH (mean over network depths).
+
+    Adversarial methods run an inner PGD maximization (encoder in eval mode so
+    BatchNorm stats aren't corrupted by the inner pass), then a first-order outer
+    step on the detached adversarial input.
+
+    teacher_model: if given (EMA teacher), topoacl/rawacl distill against the
+    teacher's stable clean topology (eval-mode, no grad) instead of the online
+    model's own clean diagram -- a collapse-free target with no BN-mode mismatch.
+    Returns (loss, stats_dict).
+    """
+    method = method.lower()
+
+    # ----- clean objectives -----
+    if method == "baseline":
+        _, _, rep = model(x)
+        return nt_xent(rep, P["temperature"]), {}
+    if method in ("phsim", "swcontrol"):
+        maps, _ = _ph_forward(model, x, P)
+        return _sep_loss_maps(method, maps, P)
+    if method == "hybrid":
+        maps, rep = _ph_forward(model, x, P)
+        loss_cos = nt_xent(rep, P["temperature"])
+        loss_ph, st = _sep_loss_maps("phsim", maps, P)
+        return P["alpha"] * loss_cos + (1.0 - P["alpha"]) * P["ph_lambda"] * loss_ph, st
+
+    eps, alpha, steps = P["adv_eps"], P["adv_alpha"], P["adv_steps"]
+
+    # ----- adversarial SSL (ACL-style): maximize the SSL loss, then train on it -----
+    if method in ADV_WRAP_METHODS:
+        core = method[len("adv_"):]
+
+        def closure(xp):
+            if core == "baseline":
+                _, _, rep = model(xp)
+                return nt_xent(rep, P["temperature"])
+            maps, _ = _ph_forward(model, xp, P)
+            return _sep_loss_maps(core, maps, P)[0]
+
+        # Inner PGD in eval mode (BN frozen); eval_mode() restores train on exit.
+        with eval_mode(model):
+            x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
+        loss = closure(x_adv)  # outer step, train-mode BN, on detached x_adv
+        return loss, {"adv_loss": float(loss.detach())}
+
+    # ----- topological adversarial consistency (flagship) + raw control -----
+    if method in CONSIST_METHODS:
+        maps_clean, rep_clean = _ph_forward(model, x, P)   # train-mode clean forward (grad kept)
+        base = nt_xent(rep_clean, P["temperature"])         # keeps clean accuracy high
+
+        if teacher_model is not None:
+            # EMA-teacher self-distillation: stable clean topology target (eval, no grad).
+            # Student's consistency forwards run in eval mode to match the teacher's
+            # BN mode (no offset); BN is still trained by the clean contrastive base.
+            with torch.no_grad():
+                maps_target = [m.detach() for m in _ph_forward(teacher_model, x, P)[0]]
+            with eval_mode(model):
+                def closure(xp):
+                    maps_adv, _ = _ph_forward(model, xp, P)
+                    return _consistency_maps(method, maps_target, maps_adv, P)[0]
+                x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
+                maps_adv, _ = _ph_forward(model, x_adv, P)        # student eval-mode (grad flows)
+                cons, st = _consistency_maps(method, maps_target, maps_adv, P)
+        else:
+            # Self-consistency: EVAL-mode clean reference for the inner ascent (else a
+            # constant BN-mode offset pollutes the target); train-vs-train for the outer.
+            with eval_mode(model):
+                maps_clean_ref = [m.detach() for m in _ph_forward(model, x, P)[0]]
+                def closure(xp):
+                    maps_adv, _ = _ph_forward(model, xp, P)
+                    return _consistency_maps(method, maps_clean_ref, maps_adv, P)[0]
+                x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
+            maps_adv, _ = _ph_forward(model, x_adv, P)
+            cons, st = _consistency_maps(method, maps_clean, maps_adv, P)
+
+        loss = base + P["adv_beta"] * cons
+        st = {**st, "base_ntxent": float(base.detach()), "consistency": float(cons.detach())}
+        return loss, st
+
+    raise ValueError(f"Unknown method={method}. Use one of {sorted(ALL_METHODS)}.")
+
+
+@torch.no_grad()
+def ema_update(ema_model, model, momentum: float):
+    """EMA update of teacher params; BN buffers (running stats) copied directly."""
+    for ep, p in zip(ema_model.parameters(), model.parameters()):
+        ep.mul_(momentum).add_(p.detach(), alpha=1.0 - momentum)
+    for eb, b in zip(ema_model.buffers(), model.buffers()):
+        eb.copy_(b)
+
+
 # -------------------------
 # Train
 # -------------------------
@@ -289,12 +426,15 @@ def train(args: DictConfig) -> None:
     assert args.backbone in ["resnet18", "resnet34"]
     base_encoder = resnet18 if args.backbone == "resnet18" else resnet34
 
+    ph_extra_layers = tuple(getattr(args.ph, "extra_layers", []) or [])
     model = SimCLR(
         base_encoder,
         projection_dim=int(args.projection_dim),
         proj_hidden_dim=int(args.model.proj_hidden_dim),
         reduce_channels=int(args.ph.reduce_channels),
         cifar_no_maxpool=True,  # IMPORTANT for PH on CIFAR
+        ph_source_layer=str(getattr(args.ph, "source_layer", "layer3")),
+        ph_extra_layers=ph_extra_layers,
     ).to(device)
 
     logger.info(f"Base model: {args.backbone}")
@@ -329,14 +469,49 @@ def train(args: DictConfig) -> None:
     temperature = float(args.temperature)
     tau_student = float(args.loss.student_temperature)
 
-    # PH loss hyperparameters (differentiable separation objective)
-    ph_num_points = int(getattr(args.ph, "num_points", 25))
-    ph_neg_k = int(getattr(args.ph, "neg_k", 4))
-    ph_margin = float(getattr(args.ph, "margin", 1.0))
-    ph_ndir = int(getattr(args.ph, "n_directions", 32))
-    ph_lambda = float(getattr(args.ph, "ph_lambda", 1.0))  # weight when combined with nt_xent
+    # Loss hyperparameters bundle (passed to compute_training_loss)
+    adv_cfg = getattr(args, "adv", None)
+    adv_eps = float(getattr(adv_cfg, "eps", 8.0 / 255.0)) if adv_cfg is not None else 8.0 / 255.0
+    adv_steps = int(getattr(adv_cfg, "steps", 5)) if adv_cfg is not None else 5
+    _adv_alpha_cfg = float(getattr(adv_cfg, "alpha", -1.0)) if adv_cfg is not None else -1.0
+    adv_alpha = _adv_alpha_cfg if _adv_alpha_cfg > 0 else 2.5 * adv_eps / max(1, adv_steps)
+    P = {
+        "temperature": float(args.temperature),
+        "num_points": int(getattr(args.ph, "num_points", 64)),
+        "neg_k": int(getattr(args.ph, "neg_k", 4)),
+        "margin": float(getattr(args.ph, "margin", 1.0)),
+        "ndir": int(getattr(args.ph, "n_directions", 32)),
+        "ph_lambda": float(getattr(args.ph, "ph_lambda", 1.0)),
+        "neg_agg": str(getattr(args.ph, "neg_agg", "hard")),
+        "softmin_temp": float(getattr(args.ph, "softmin_temp", 0.1)),
+        "alpha": float(getattr(args.loss, "alpha", 0.9)),
+        "multiscale": len(ph_extra_layers) > 0,
+        "adv_eps": adv_eps,
+        "adv_alpha": adv_alpha,
+        "adv_steps": adv_steps,
+        "adv_beta": float(getattr(adv_cfg, "beta", 1.0)) if adv_cfg is not None else 1.0,
+        "adv_random_start": bool(getattr(adv_cfg, "random_start", True)) if adv_cfg is not None else True,
+    }
 
     warmup_epochs = int(getattr(args.train, "warmup_epochs", 0))
+
+    # EMA teacher (optional, for topoacl/rawacl self-distillation under attack)
+    import copy as _copy
+    method_lc = str(args.method).lower()
+    use_ema = (str(getattr(adv_cfg, "teacher", "none")).lower() == "ema"
+               and method_lc in CONSIST_METHODS) if adv_cfg is not None else False
+    ema_model = None
+    if use_ema:
+        ema_model = _copy.deepcopy(model)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+        ema_model.eval()
+        logger.info("EMA teacher enabled for topological self-distillation.")
+    ema_momentum = float(getattr(adv_cfg, "ema_momentum", 0.996)) if adv_cfg is not None else 0.996
+
+    # Adversarial curriculum: linearly ramp eps & beta over `ramp_epochs`.
+    base_adv_eps, base_adv_beta = P["adv_eps"], P["adv_beta"]
+    adv_ramp_epochs = int(getattr(adv_cfg, "ramp_epochs", 0)) if adv_cfg is not None else 0
 
     # -------------------------
     # Early stopping (gamma-based)
@@ -363,6 +538,13 @@ def train(args: DictConfig) -> None:
         loss_meter = AverageMeter("loss")
         bar = tqdm(train_loader, total=steps_per_epoch)
 
+        # Adversarial curriculum: scale eps/alpha/beta by the ramp factor.
+        if adv_ramp_epochs > 0:
+            ramp = min(1.0, epoch / float(adv_ramp_epochs))
+            P["adv_eps"] = base_adv_eps * ramp
+            P["adv_alpha"] = 2.5 * P["adv_eps"] / max(1, P["adv_steps"])
+            P["adv_beta"] = base_adv_beta * ramp
+
         for step, (x, _) in enumerate(bar):
             if max_steps is not None and step >= max_steps:
                 break
@@ -373,48 +555,23 @@ def train(args: DictConfig) -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            h_map_small, _, rep = model(x)
 
             method = str(args.method).lower()
-            ph_methods = ["phsim", "swcontrol", "hybrid"]
-            if method in ph_methods and warmup_epochs > 0 and epoch <= warmup_epochs:
+            # Warmup: train clean baseline for the first warmup_epochs (stabilizes
+            # the encoder before topology/adversarial objectives kick in).
+            if method != "baseline" and warmup_epochs > 0 and epoch <= warmup_epochs:
                 method_eff = "baseline"
             else:
                 method_eff = method
 
-            sep_fn = topo_separation_loss if method_eff != "swcontrol" else raw_sw_separation_loss
-
-            if method_eff == "baseline":
-                loss = nt_xent(rep, temperature)
-
-            elif method_eff in ("phsim", "swcontrol"):
-                # Differentiable persistent-separation (or non-topological control)
-                loss, _ = sep_fn(
-                    h_map_small,
-                    num_points=ph_num_points,
-                    neg_k=ph_neg_k,
-                    margin=ph_margin,
-                    n_directions=ph_ndir,
-                )
-
-            elif method_eff == "hybrid":
-                alpha = float(args.loss.alpha)
-                loss_cos = nt_xent(rep, temperature)
-                loss_ph, _ = topo_separation_loss(
-                    h_map_small,
-                    num_points=ph_num_points,
-                    neg_k=ph_neg_k,
-                    margin=ph_margin,
-                    n_directions=ph_ndir,
-                )
-                loss = alpha * loss_cos + (1.0 - alpha) * ph_lambda * loss_ph
-
-            else:
-                raise ValueError(f"Unknown method={args.method}. Use baseline|phsim|swcontrol|hybrid.")
+            loss, _ = compute_training_loss(model, x, method_eff, P,
+                                            teacher_model=ema_model if method_eff in CONSIST_METHODS else None)
 
             loss.backward()
             optimizer.step()
             scheduler.step()
+            if ema_model is not None:
+                ema_update(ema_model, model, ema_momentum)
 
             loss_meter.update(loss.item(), n=x.size(0))
             bar.set_description(f"epoch {epoch} | loss {loss_meter.avg:.4f}")

@@ -54,7 +54,18 @@ model:
 
 ph:
   reduce_channels: 8
-  num_points: 25
+  # PH point-cloud source layer: layer3 -> 4x4=16 pts (default), layer2 -> 8x8=64 pts
+  # (richer, supports H1). layer4 is the old 2x2=4-pt behavior (too coarse).
+  source_layer: layer3
+  # extra_layers: enable MULTISCALE PH by adding more depths, e.g. [layer2]
+  # (loss is averaged over source_layer + extra_layers). Empty = single scale.
+  extra_layers: []
+  num_points: 64
+  margin: 1.0
+  n_directions: 32
+  ph_lambda: 1.0
+  neg_agg: hard          # hard (min) | soft (smooth-min over all negatives)
+  softmin_temp: 0.1
   pi_grid: 12
   pi_sigma: 0.15
   birth_min: 0.0
@@ -67,6 +78,24 @@ ph:
   wasserstein_tau: 1.0  # scale for distance->teacher logits
   w_h0: 0.2
   w_h1: 1.0
+# ==============================
+# Adversarial training (PH-ACL) configuration
+# ==============================
+# Used by adversarial methods: adv_baseline (=ACL), adv_phsim, adv_swcontrol,
+# topoacl (flagship: NT-Xent + beta * topological adversarial consistency),
+# rawacl (non-topological consistency control).
+adv:
+  eps: 0.031372549     # 8/255 Linf inner-maximization budget
+  alpha: -1.0          # step size; -1 => 2.5*eps/steps
+  steps: 5             # inner PGD steps (cost ~ steps x; 3-7 typical)
+  beta: 1.0            # weight on the adversarial-consistency term (topoacl/rawacl)
+  random_start: true
+  ramp_epochs: 0       # curriculum: linearly ramp eps & beta from ~0 over this many
+                       # epochs (0 = no ramp). Stabilizes adversarial-from-scratch.
+  teacher: none        # none | ema : EMA-teacher topological self-distillation
+                       # (topoacl/rawacl match a momentum teacher's clean diagram)
+  ema_momentum: 0.996
+
 # ==============================
 # Loss configuration
 # ==============================

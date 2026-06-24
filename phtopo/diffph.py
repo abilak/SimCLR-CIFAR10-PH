@@ -209,9 +209,13 @@ def sliced_wasserstein_pd(
     projA, _ = torch.sort(projA, dim=0)
     projB, _ = torch.sort(projB, dim=0)
 
-    # W1 in 1D between equal-size sets = mean abs diff of sorted coords.
-    w1_per_dir = (projA - projB).abs().mean(dim=0)  # (K,)
-    sw = w1_per_dir.mean() * math.pi / math.pi  # average over directions ~ SW1/pi * pi
+    # Canonical SW (Carriere-Cuturi-Oudot): SUM the 1D transport cost over the
+    # augmented points per direction, then average over directions. Using sum
+    # (not mean) is essential when diagrams differ in size -- mean would divide
+    # by the (pair-dependent) augmented cardinality and distort cross-pair
+    # comparisons (e.g. class-separation Gamma over differently-sized diagrams).
+    w1_per_dir = (projA - projB).abs().sum(dim=0)  # (K,)
+    sw = w1_per_dir.mean()  # average over directions
     return sw
 
 
@@ -271,8 +275,8 @@ def sliced_wasserstein_h0_batch(
     projB = B_aug @ dirs.t()
     projA, _ = torch.sort(projA, dim=1)
     projB, _ = torch.sort(projB, dim=1)
-    w1 = (projA - projB).abs().mean(dim=1)  # (B, K)
-    return w1.mean(dim=1)                    # (B,)
+    w1 = (projA - projB).abs().sum(dim=1)  # (B, K) -- SUM over points (canonical SW)
+    return w1.mean(dim=1)                   # (B,) -- average over directions
 
 
 # ---------------------------------------------------------------------------

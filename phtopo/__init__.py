@@ -12,9 +12,12 @@ from .diffph import (
 from .losses import (
     topo_separation_loss,
     raw_sw_separation_loss,
+    topo_consistency_loss,
+    raw_consistency_loss,
     feature_map_to_pointcloud,
     standardize_pointcloud_batch,
 )
+from .adv import pgd_ascent_on_loss
 
 __all__ = [
     "vr_h0_persistence",
@@ -27,6 +30,9 @@ __all__ = [
     "persistence_entropy",
     "topo_separation_loss",
     "raw_sw_separation_loss",
+    "topo_consistency_loss",
+    "raw_consistency_loss",
     "feature_map_to_pointcloud",
     "standardize_pointcloud_batch",
+    "pgd_ascent_on_loss",
 ]

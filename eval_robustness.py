@@ -36,10 +36,12 @@ from models import SimCLR
 from phtopo.robustness import run_robustness_suite
 
 
-def build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device):
+def build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device,
+                  ph_source_layer="layer4", ph_extra_layers=()):
     base = resnet18 if backbone == "resnet18" else resnet34
     m = SimCLR(base, projection_dim=projection_dim, proj_hidden_dim=proj_hidden_dim,
-               reduce_channels=reduce_channels, cifar_no_maxpool=True).to(device)
+               reduce_channels=reduce_channels, cifar_no_maxpool=True,
+               ph_source_layer=ph_source_layer, ph_extra_layers=tuple(ph_extra_layers)).to(device)
     return m
 
 
@@ -61,8 +63,13 @@ def load_encoder_from_ckpt(path, device):
     backbone = cfg.get("backbone", "resnet18")
     projection_dim = int(cfg.get("projection_dim", 64))
     proj_hidden_dim = int(cfg.get("model", {}).get("proj_hidden_dim", 512)) if isinstance(cfg.get("model"), dict) else 512
-    reduce_channels = int(cfg.get("ph", {}).get("reduce_channels", 8)) if isinstance(cfg.get("ph"), dict) else 8
-    enc = build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device)
+    ph_cfg = cfg.get("ph", {}) if isinstance(cfg.get("ph"), dict) else {}
+    reduce_channels = int(ph_cfg.get("reduce_channels", 8))
+    # Fallback to layer4 for old checkpoints that predate the source_layer option.
+    ph_source_layer = str(ph_cfg.get("source_layer", "layer4"))
+    ph_extra_layers = tuple(ph_cfg.get("extra_layers", []) or [])
+    enc = build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device,
+                        ph_source_layer=ph_source_layer, ph_extra_layers=ph_extra_layers)
     state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
     enc.load_state_dict(state, strict=True)
     for p in enc.parameters():

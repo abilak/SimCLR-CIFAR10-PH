@@ -396,14 +396,6 @@ def finetune(args: DictConfig) -> None:
     assert args.backbone in ["resnet18", "resnet34"]
     base_encoder = resnet18 if args.backbone == "resnet18" else resnet34
 
-    pre_model = SimCLR(
-        base_encoder_fn=base_encoder,
-        projection_dim=int(args.projection_dim),
-        proj_hidden_dim=int(args.model.proj_hidden_dim),
-        reduce_channels=int(args.ph.reduce_channels),
-        cifar_no_maxpool=True,
-    ).to(device)
-
     # checkpoint path (robust)
     ckpt_path = getattr(args, "ckpt_path", None)
     if ckpt_path is not None:
@@ -421,6 +413,23 @@ def finetune(args: DictConfig) -> None:
         raise FileNotFoundError(f"Upstream checkpoint not found: {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
+    # Build the encoder to MATCH the checkpoint's PH source layer (the 1x1 ph_reduce
+    # conv's in-channels depend on it). Old checkpoints predate this option -> layer4.
+    ckpt_cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    ph_cfg = ckpt_cfg.get("ph", {}) if isinstance(ckpt_cfg.get("ph"), dict) else {}
+    ph_source_layer = str(ph_cfg.get("source_layer", "layer4"))
+    ph_extra_layers = tuple(ph_cfg.get("extra_layers", []) or [])
+
+    pre_model = SimCLR(
+        base_encoder_fn=base_encoder,
+        projection_dim=int(args.projection_dim),
+        proj_hidden_dim=int(args.model.proj_hidden_dim),
+        reduce_channels=int(args.ph.reduce_channels),
+        cifar_no_maxpool=True,
+        ph_source_layer=ph_source_layer,
+        ph_extra_layers=ph_extra_layers,
+    ).to(device)
+
     if isinstance(ckpt, dict) and "model" in ckpt:
         pre_model.load_state_dict(ckpt["model"], strict=True)
     else:

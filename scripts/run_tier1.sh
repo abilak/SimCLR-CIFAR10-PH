@@ -62,14 +62,17 @@ for seed in "${SEEDS[@]}"; do
 done
 
 # ----------------------------------------------------------------------------
-# #3 Mechanism: class-conditioned topology, clean vs attacked, per method
-#    (use seed 0 final-epoch checkpoints; repeat across seeds as desired).
+# #3 Mechanism: class-conditioned topology, clean vs attacked, per method,
+#    for EVERY seed (so the Γ-stability ordering has n=#seeds, not n=1).
 # ----------------------------------------------------------------------------
-$PY eval_mechanism.py \
-    --ckpt baseline=$(ckpt_path baseline 0 "$EPOCHS") \
-    --ckpt phsim=$(ckpt_path phsim 0 "$EPOCHS") \
-    --ckpt swcontrol=$(ckpt_path swcontrol 0 "$EPOCHS") \
-    --out "$OUT/mechanism" --eps_px "$EPS_PX" --per_class 80
+for seed in "${SEEDS[@]}"; do
+  echo "==== MECHANISM seed=$seed ===="
+  $PY eval_mechanism.py \
+      --ckpt baseline=$(ckpt_path baseline "$seed" "$EPOCHS") \
+      --ckpt phsim=$(ckpt_path phsim "$seed" "$EPOCHS") \
+      --ckpt swcontrol=$(ckpt_path swcontrol "$seed" "$EPOCHS") \
+      --out "$OUT/mechanism/seed${seed}" --eps_px "$EPS_PX" --per_class 80
+done
 
 # ----------------------------------------------------------------------------
 # #2 + #4 Stats. First merge per-checkpoint Gamma + robustness into one CSV
