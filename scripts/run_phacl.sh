@@ -27,18 +27,18 @@
 set -euo pipefail
 
 BACKBONE=resnet18
-SEEDS=(0 1 2)
-METHODS=(baseline adv_baseline adv_phsim adv_swcontrol topoacl rawacl)
+SEEDS=(0)               # 1 seed for a same-day directional read; expand to (0 1 2) after
+METHODS=(baseline adv_baseline topoacl rawacl)   # the 4 that answer the 2 decisive questions
 EPOCHS=50
 SAVE_EVERY=10
 WARMUP=5                  # clean-baseline warmup epochs (stabilizes adv methods)
 EPS_PX=8
-ADV_STEPS=5               # inner-PGD steps for adversarial methods
+ADV_STEPS=3               # valid inner attack, ~1.5x faster than 5
 SOURCE_LAYER=layer3       # 16-pt PH cloud; set layer2 (64 pts) for richer/H1
 EXTRA_LAYERS="[]"         # multiscale, e.g. "[layer2]" to add a second depth
 NEG_AGG=hard              # or 'soft' (smooth-min over all negatives)
-DUAL_BN=false             # true => AdvProp/AdvCL dual-BN (clean/adv split BN) for adv methods
-OUT=runs/phacl
+DUAL_BN=true              # the whole point: AdvProp/AdvCL dual-BN (clean/adv split BN) for adv methods
+OUT=runs/phacl_dualbn     # fresh dir, doesn't touch your old runs
 PY=python
 
 mkdir -p "$OUT"/{upstream,robustness,mechanism,stats}
@@ -76,7 +76,7 @@ done
 # ---- Mechanism (#3): topology under attack, all seeds ----------------------
 for seed in "${SEEDS[@]}"; do
   args=()
-  for m in baseline adv_baseline adv_phsim adv_swcontrol topoacl rawacl; do
+  for m in "${METHODS[@]}"; do
     args+=(--ckpt "$m=$(ckpt_path "$m" "$seed" "$EPOCHS")")
   done
   $PY eval_mechanism.py "${args[@]}" --out "$OUT/mechanism/seed${seed}" --eps_px "$EPS_PX" --per_class 80
