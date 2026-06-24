@@ -95,6 +95,10 @@ adv:
   teacher: none        # none | ema : EMA-teacher topological self-distillation
                        # (topoacl/rawacl match a momentum teacher's clean diagram)
   ema_momentum: 0.996
+  dual_bn: false       # AdvProp/AdvCL: route clean->clean-BN, adv->adv-BN (separate
+                       # BatchNorm branches; shared conv weights). Only affects
+                       # adversarial methods. Eval/inference uses the clean branch.
+                       # For adv_* methods the loss becomes clean_loss + adv_loss.
 
 # ==============================
 # Loss configuration

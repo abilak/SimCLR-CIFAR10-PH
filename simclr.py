@@ -40,6 +40,7 @@ from phtopo.losses import (
     topo_consistency_loss, raw_consistency_loss,
 )
 from phtopo.adv import pgd_ascent_on_loss, eval_mode
+from phtopo.dual_bn import convert_to_dual_bn, bn_route, count_dual_bn, sync_adv_bn_from_clean
 from phtopo.descriptors import class_separation_gamma
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,16 @@ def _ph_forward(model, x, P):
     return [h_map], rep
 
 
+def _ph_maps_only(model, x, P):
+    """
+    PH feature maps ONLY, skipping layer4 + avgpool + projector (which aren't in
+    the PH-map graph). Numerically identical to `_ph_forward(model, x, P)[0]` but
+    avoids the wasted deep-layer compute -- a meaningful speedup for the inner PGD
+    of the separation/consistency methods, where this runs once per ascent step.
+    """
+    return model.ph_maps_only(x)
+
+
 def _sep_loss_maps(core, maps, P):
     """Mean separation loss over the (multiscale) list of maps. Returns (loss, stats)."""
     fn = topo_separation_loss if core == "phsim" else raw_sw_separation_loss
@@ -281,6 +292,13 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
     teacher_model: if given (EMA teacher), topoacl/rawacl distill against the
     teacher's stable clean topology (eval-mode, no grad) instead of the online
     model's own clean diagram -- a collapse-free target with no BN-mode mismatch.
+
+    Dual-BN (P["dual_bn"]=True, AdvProp/AdvCL): clean inputs route through clean-BN
+    and adversarial inputs through adv-BN. For adv_* methods the loss becomes
+    clean_loss + adv_loss (both branches trained every step); for topoacl/rawacl
+    the clean base trains clean-BN and the adversarial-consistency branch trains
+    adv-BN. Eval/inference uses clean-BN (default route). Requires the model to have
+    been converted with phtopo.dual_bn.convert_to_dual_bn (train() does this).
     Returns (loss, stats_dict).
     """
     method = method.lower()
@@ -290,7 +308,7 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
         _, _, rep = model(x)
         return nt_xent(rep, P["temperature"]), {}
     if method in ("phsim", "swcontrol"):
-        maps, _ = _ph_forward(model, x, P)
+        maps = _ph_maps_only(model, x, P)
         return _sep_loss_maps(method, maps, P)
     if method == "hybrid":
         maps, rep = _ph_forward(model, x, P)
@@ -299,6 +317,7 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
         return P["alpha"] * loss_cos + (1.0 - P["alpha"]) * P["ph_lambda"] * loss_ph, st
 
     eps, alpha, steps = P["adv_eps"], P["adv_alpha"], P["adv_steps"]
+    dual_bn = bool(P.get("dual_bn", False))
 
     # ----- adversarial SSL (ACL-style): maximize the SSL loss, then train on it -----
     if method in ADV_WRAP_METHODS:
@@ -308,10 +327,25 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
             if core == "baseline":
                 _, _, rep = model(xp)
                 return nt_xent(rep, P["temperature"])
-            maps, _ = _ph_forward(model, xp, P)
+            maps = _ph_maps_only(model, xp, P)
             return _sep_loss_maps(core, maps, P)[0]
 
-        # Inner PGD in eval mode (BN frozen); eval_mode() restores train on exit.
+        if dual_bn:
+            # AdvProp / AdvCL: attack and consume adversarial inputs through the
+            # adv-BN branch, and ALSO train the clean-BN branch on the clean inputs
+            # in the same step (clean_loss + adv_loss). Both branches see data every
+            # step, so neither branch's running stats go stale, and eval (clean
+            # branch, default route) sees properly trained clean statistics.
+            with eval_mode(model), bn_route("adv"):
+                x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
+            with bn_route("clean"):
+                l_clean = closure(x)          # trains clean_bn
+            with bn_route("adv"):
+                l_adv = closure(x_adv)        # trains adv_bn
+            loss = l_clean + l_adv
+            return loss, {"adv_loss": float(l_adv.detach()), "clean_loss": float(l_clean.detach())}
+
+        # Single-BN: inner PGD in eval mode (BN frozen), outer train-mode step.
         with eval_mode(model):
             x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
         loss = closure(x_adv)  # outer step, train-mode BN, on detached x_adv
@@ -319,6 +353,39 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
 
     # ----- topological adversarial consistency (flagship) + raw control -----
     if method in CONSIST_METHODS:
+        if dual_bn:
+            # The clean NT-Xent base trains clean-BN -- the branch used at
+            # inference/eval -- on clean inputs only (clean-BN is never exposed to
+            # adversarial-batch statistics). The adversarial CONSISTENCY is measured
+            # ENTIRELY WITHIN the adv branch, in eval mode, so that the clean target
+            # and the adversarial forward share the IDENTICAL normalization. The loss
+            # then reflects ONLY perturbation-induced topology drift (exactly 0 when
+            # x_adv == x), NOT the (large, learned) gap between the clean-BN and
+            # adv-BN branches -- comparing clean-BN(x) to adv-BN(x_adv) would
+            # contaminate the signal with that branch gap and perversely push the
+            # two branches back together, defeating dual-BN. adv-BN's affine
+            # parameters are trained by this consistency gradient.
+            with bn_route("clean"):
+                _, rep_clean = _ph_forward(model, x, P)
+                base = nt_xent(rep_clean, P["temperature"])
+            with eval_mode(model), bn_route("adv"):
+                if teacher_model is not None:
+                    # Stable EMA target, same (adv) branch & mode as the student's
+                    # adversarial forward, so the only difference is the perturbation.
+                    with torch.no_grad():
+                        maps_ref = [m.detach() for m in _ph_maps_only(teacher_model, x, P)]
+                else:
+                    maps_ref = [m.detach() for m in _ph_maps_only(model, x, P)]
+                def closure(xp):
+                    maps_adv = _ph_maps_only(model, xp, P)
+                    return _consistency_maps(method, maps_ref, maps_adv, P)[0]
+                x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
+                maps_adv = _ph_maps_only(model, x_adv, P)   # eval-mode adv-BN; grad flows
+                cons, st = _consistency_maps(method, maps_ref, maps_adv, P)
+            loss = base + P["adv_beta"] * cons
+            st = {**st, "base_ntxent": float(base.detach()), "consistency": float(cons.detach())}
+            return loss, st
+
         maps_clean, rep_clean = _ph_forward(model, x, P)   # train-mode clean forward (grad kept)
         base = nt_xent(rep_clean, P["temperature"])         # keeps clean accuracy high
 
@@ -327,24 +394,24 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
             # Student's consistency forwards run in eval mode to match the teacher's
             # BN mode (no offset); BN is still trained by the clean contrastive base.
             with torch.no_grad():
-                maps_target = [m.detach() for m in _ph_forward(teacher_model, x, P)[0]]
+                maps_target = [m.detach() for m in _ph_maps_only(teacher_model, x, P)]
             with eval_mode(model):
                 def closure(xp):
-                    maps_adv, _ = _ph_forward(model, xp, P)
+                    maps_adv = _ph_maps_only(model, xp, P)
                     return _consistency_maps(method, maps_target, maps_adv, P)[0]
                 x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
-                maps_adv, _ = _ph_forward(model, x_adv, P)        # student eval-mode (grad flows)
+                maps_adv = _ph_maps_only(model, x_adv, P)         # student eval-mode (grad flows)
                 cons, st = _consistency_maps(method, maps_target, maps_adv, P)
         else:
             # Self-consistency: EVAL-mode clean reference for the inner ascent (else a
             # constant BN-mode offset pollutes the target); train-vs-train for the outer.
             with eval_mode(model):
-                maps_clean_ref = [m.detach() for m in _ph_forward(model, x, P)[0]]
+                maps_clean_ref = [m.detach() for m in _ph_maps_only(model, x, P)]
                 def closure(xp):
-                    maps_adv, _ = _ph_forward(model, xp, P)
+                    maps_adv = _ph_maps_only(model, xp, P)
                     return _consistency_maps(method, maps_clean_ref, maps_adv, P)[0]
                 x_adv = pgd_ascent_on_loss(closure, x, eps, alpha, steps, P["adv_random_start"])
-            maps_adv, _ = _ph_forward(model, x_adv, P)
+            maps_adv = _ph_maps_only(model, x_adv, P)
             cons, st = _consistency_maps(method, maps_clean, maps_adv, P)
 
         loss = base + P["adv_beta"] * cons
@@ -356,10 +423,22 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
 
 @torch.no_grad()
 def ema_update(ema_model, model, momentum: float):
-    """EMA update of teacher params; BN buffers (running stats) copied directly."""
-    for ep, p in zip(ema_model.parameters(), model.parameters()):
+    """
+    EMA update of teacher params; BN buffers (running stats) copied directly.
+
+    Teacher and student must have identical structure (the teacher is a deepcopy
+    of the student made AFTER any dual-BN conversion), so the positional zips align
+    -- including each dual-BN branch's running_mean/var/num_batches_tracked. Assert
+    equal counts so a future structural divergence fails loudly instead of silently
+    truncating (zip stops at the shorter sequence).
+    """
+    ep_list, p_list = list(ema_model.parameters()), list(model.parameters())
+    eb_list, b_list = list(ema_model.buffers()), list(model.buffers())
+    assert len(ep_list) == len(p_list), f"EMA param count mismatch: {len(ep_list)} vs {len(p_list)}"
+    assert len(eb_list) == len(b_list), f"EMA buffer count mismatch: {len(eb_list)} vs {len(b_list)}"
+    for ep, p in zip(ep_list, p_list):
         ep.mul_(momentum).add_(p.detach(), alpha=1.0 - momentum)
-    for eb, b in zip(ema_model.buffers(), model.buffers()):
+    for eb, b in zip(eb_list, b_list):
         eb.copy_(b)
 
 
@@ -441,6 +520,18 @@ def train(args: DictConfig) -> None:
     logger.info(f"feature dim: {model.feature_dim}, projection dim: {args.projection_dim}")
     logger.info(f"method: {args.method}")
 
+    # Dual-BN (AdvProp/AdvCL): only meaningful for adversarial methods, where clean
+    # and adversarial inputs are routed through separate BN branches. Convert BEFORE
+    # the optimizer (so adv-BN params are optimized) and BEFORE the EMA deepcopy (so
+    # the teacher matches). Default off => zero change to the single-BN path.
+    _adv_cfg0 = getattr(args, "adv", None)
+    _method_lc0 = str(args.method).lower()
+    _adv_method = _method_lc0 in (ADV_WRAP_METHODS | CONSIST_METHODS)
+    use_dual_bn = (bool(getattr(_adv_cfg0, "dual_bn", False)) and _adv_method) if _adv_cfg0 is not None else False
+    if use_dual_bn:
+        convert_to_dual_bn(model)
+        logger.info(f"Dual-BN enabled: converted {count_dual_bn(model)} BatchNorm2d -> DualBatchNorm2d")
+
     # Optimizer
     optimizer = torch.optim.SGD(
         list(model.parameters()),
@@ -491,6 +582,7 @@ def train(args: DictConfig) -> None:
         "adv_steps": adv_steps,
         "adv_beta": float(getattr(adv_cfg, "beta", 1.0)) if adv_cfg is not None else 1.0,
         "adv_random_start": bool(getattr(adv_cfg, "random_start", True)) if adv_cfg is not None else True,
+        "dual_bn": use_dual_bn,
     }
 
     warmup_epochs = int(getattr(args.train, "warmup_epochs", 0))
@@ -537,6 +629,15 @@ def train(args: DictConfig) -> None:
     for epoch in range(1, int(args.epochs) + 1):
         loss_meter = AverageMeter("loss")
         bar = tqdm(train_loader, total=steps_per_epoch)
+
+        # Dual-BN warm start: at the first adversarial epoch (right after a clean
+        # warmup, during which only clean-BN was trained), copy the warmed-up
+        # clean-BN stats into adv-BN so the adv branch doesn't begin from stale init.
+        if use_dual_bn and warmup_epochs > 0 and epoch == warmup_epochs + 1:
+            n_sync = sync_adv_bn_from_clean(model)
+            if ema_model is not None:
+                ema_update(ema_model, model, momentum=0.0)  # hard-sync teacher to the warm-started student
+            logger.info(f"Dual-BN warm start: synced adv-BN from clean-BN ({n_sync} branches) at epoch {epoch}")
 
         # Adversarial curriculum: scale eps/alpha/beta by the ramp factor.
         if adv_ramp_epochs > 0:

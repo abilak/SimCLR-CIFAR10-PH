@@ -37,6 +37,7 @@ ADV_STEPS=5               # inner-PGD steps for adversarial methods
 SOURCE_LAYER=layer3       # 16-pt PH cloud; set layer2 (64 pts) for richer/H1
 EXTRA_LAYERS="[]"         # multiscale, e.g. "[layer2]" to add a second depth
 NEG_AGG=hard              # or 'soft' (smooth-min over all negatives)
+DUAL_BN=false             # true => AdvProp/AdvCL dual-BN (clean/adv split BN) for adv methods
 OUT=runs/phacl
 PY=python
 
@@ -55,7 +56,7 @@ for seed in "${SEEDS[@]}"; do
         epochs="$EPOCHS" log_interval="$SAVE_EVERY" train.warmup_epochs="$WARMUP" \
         data.subset_size=-1 train.max_steps=-1 \
         ph.source_layer="$SOURCE_LAYER" "ph.extra_layers=$EXTRA_LAYERS" ph.neg_agg="$NEG_AGG" \
-        adv.steps="$ADV_STEPS" adv.eps=$(python -c "print($EPS_PX/255)") \
+        adv.steps="$ADV_STEPS" adv.eps=$(python -c "print($EPS_PX/255)") adv.dual_bn="$DUAL_BN" \
         hydra.run.dir="$rd" hydra.output_subdir=.hydra hydra.job.chdir=true
   done
 done

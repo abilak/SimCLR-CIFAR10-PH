@@ -16,6 +16,7 @@ class SimCLR(nn.Module):
     # layer3 4x4/256ch, layer4 2x2/512ch. layer4 gives only 4 points -- too few for
     # meaningful persistent homology -- so the PH source layer is configurable.
     _LAYER_CHANNELS = {"layer1": 64, "layer2": 128, "layer3": 256, "layer4": 512}
+    _LAYER_ORDER = ["layer1", "layer2", "layer3", "layer4"]
 
     def __init__(
         self,
@@ -73,6 +74,40 @@ class SimCLR(nn.Module):
         x = self.layer3(x); feats["layer3"] = x
         x = self.layer4(x); feats["layer4"] = x
         return feats
+
+    def _backbone_feats_upto(self, x, needed):
+        """
+        Run the backbone only as deep as the deepest layer in `needed`, returning
+        the collected feature maps. Used by ph_maps_only: when PH is sourced from
+        layer3, layer4 (and the projector) are never needed, so the inner PGD /
+        separation / consistency forwards can skip the deepest, most expensive
+        block entirely. Produces feature maps IDENTICAL to _backbone_feats for the
+        layers it computes (same modules, same order).
+        """
+        max_idx = max(self._LAYER_ORDER.index(L) for L in needed)
+        x = self.stem(x)
+        feats = {}
+        for i, name in enumerate(self._LAYER_ORDER):
+            x = getattr(self, name)(x)
+            feats[name] = x
+            if i >= max_idx:
+                break
+        return feats
+
+    def ph_maps_only(self, x):
+        """
+        Just the (multiscale) list of reduced PH feature maps -- no pooled feature
+        `h`, no projection `rep`, and no backbone layers deeper than the PH source.
+        Numerically identical to ph_maps(x)[0] for the maps it returns; use it in
+        forwards that consume ONLY the PH maps (the separation / consistency losses
+        and their inner PGD), where computing layer4 + the projector is wasted work.
+        """
+        needed = [self.ph_source_layer] + list(self.ph_extra_layers)
+        feats = self._backbone_feats_upto(x, needed)
+        maps = [self.ph_reduce(feats[self.ph_source_layer])]
+        for L in self.ph_extra_layers:
+            maps.append(self.ph_reduce_extra[L](feats[L]))
+        return maps
 
     def forward(self, x):
         feats = self._backbone_feats(x)

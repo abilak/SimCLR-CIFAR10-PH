@@ -18,6 +18,15 @@ from .losses import (
     standardize_pointcloud_batch,
 )
 from .adv import pgd_ascent_on_loss
+from .dual_bn import (
+    DualBatchNorm2d,
+    bn_route,
+    convert_to_dual_bn,
+    has_dual_bn,
+    count_dual_bn,
+    state_dict_is_dual_bn,
+    load_state_dict_auto,
+)
 
 __all__ = [
     "vr_h0_persistence",
@@ -35,4 +44,11 @@ __all__ = [
     "feature_map_to_pointcloud",
     "standardize_pointcloud_batch",
     "pgd_ascent_on_loss",
+    "DualBatchNorm2d",
+    "bn_route",
+    "convert_to_dual_bn",
+    "has_dual_bn",
+    "count_dual_bn",
+    "state_dict_is_dual_bn",
+    "load_state_dict_auto",
 ]

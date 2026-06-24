@@ -83,10 +83,38 @@ an eval-mode clean reference so the inner objective is 0 at the clean input;
 (b) the eval/train toggle is now an exception-safe `eval_mode()` context;
 (c) the multiscale aggregation asserts equal map counts. All in `tests/test_adv.py`.
 
+## Dual-BN (AdvProp / AdvCL) — implemented (`adv.dual_bn=true`)
+Clean and adversarial inputs have different feature statistics; forcing both
+through one BatchNorm corrupts the running stats the clean-eval path relies on.
+Dual-BN keeps two BN branches (`clean_bn`, `adv_bn`) with all conv weights shared,
+routes clean inputs through clean-BN and adversarial inputs through adv-BN, and
+uses the clean branch at inference (the AdvProp convention). It is the known key
+enabler for adversarial SSL and is expected to lift every adversarial method.
+Implementation in `phtopo/dual_bn.py`; off by default (zero change to the
+single-BN path). Design decisions, each correctness-tested in `tests/test_dual_bn.py`:
+- **Routing** via a `contextvars.ContextVar` read at forward time (autograd
+  replays the branch that actually ran). Default route `clean`, so every
+  dual-BN-unaware path (linear probe, robustness/mechanism eval, inference) uses
+  clean-BN automatically. No-op for non-converted models.
+- **Conversion** clones each `nn.BatchNorm2d` into both branches exactly
+  (params, running stats, `num_batches_tracked`, eps/momentum/affine/track flags,
+  device, dtype) — so a freshly-converted model is bit-identical to the original.
+  Self-describing checkpoints (`clean_bn`/`adv_bn` keys) auto-convert any loader
+  via `load_state_dict_auto`, no config plumbing.
+- **adv_\* methods** become true AdvProp: loss = `clean_loss`(clean-BN) +
+  `adv_loss`(adv-BN); both branches are trained every step.
+- **topoacl/rawacl**: the clean NT-Xent base trains clean-BN; the adversarial
+  consistency is measured **entirely within the adv branch (eval mode)**, so the
+  clean target and the adversarial forward share the *identical* normalization and
+  the loss reflects only perturbation-induced topology drift (≈0 at `x_adv=x`).
+  Comparing clean-BN(x) to adv-BN(x_adv) instead would contaminate the signal with
+  the (large, learned) clean-vs-adv branch gap and perversely pull the branches
+  back together — caught by an independent review and a dedicated regression test.
+- **Warm start**: at the warmup→adversarial transition, adv-BN is re-synced from
+  the warmed-up clean-BN (`sync_adv_bn_from_clean`) so it doesn't begin from stale
+  init; the EMA teacher is hard-synced at the same point.
+
 ## Further ideas (not yet implemented — roadmap)
-- **Dual-BN (AdvCL-style)**: separate BN for clean vs adversarial branches —
-  the known key enabler for adversarial SSL; would likely lift every adv method.
-  Higher implementation surface (BN routing + checkpoint plumbing).
 - **Persistence-image / landscape auxiliary head**: a differentiable diagram
   vectorization feeding a small predictor — richer topological signal than a
   scalar SW.
@@ -123,6 +151,12 @@ python analyze_results.py --csv runs/summary/phacl_merged.csv \
 
 ## Cost
 Adversarial methods cost ≈ `adv.steps`× the clean per-step time (default 5 → ~5×).
+The separation/consistency methods (`adv_phsim`, `adv_swcontrol`, `topoacl`,
+`rawacl`) source PH from `layer3`, so their inner-PGD forwards use a PH-only
+forward (`model.ph_maps_only`) that skips `layer4` + the projector — ~55% cheaper
+per backbone forward, numerically identical (verified `torch.equal` + a layer4
+forward-hook in `tests/test_adv.py`). `adv_baseline` still does the full forward
+(its NT-Xent needs the projection). Lower `adv.steps` (e.g. 3) during iteration.
 `topoacl`/`rawacl` add one clean forward on top. With layer3 + `adv.steps=5`,
 budget a pilot run at a few× the clean pilot. Use `adv.steps=3` and
 `--max_test_batches` during iteration; raise for final numbers. A clean warmup

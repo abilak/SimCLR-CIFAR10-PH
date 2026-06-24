@@ -43,6 +43,7 @@ from torchvision.models import resnet18, resnet34
 from tqdm import tqdm
 
 from models import SimCLR
+from phtopo.dual_bn import load_state_dict_auto
 
 logger = logging.getLogger(__name__)
 
@@ -430,10 +431,10 @@ def finetune(args: DictConfig) -> None:
         ph_extra_layers=ph_extra_layers,
     ).to(device)
 
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        pre_model.load_state_dict(ckpt["model"], strict=True)
-    else:
-        pre_model.load_state_dict(ckpt, strict=True)
+    # Auto-converts to dual-BN iff the checkpoint is dual-BN; the linear probe then
+    # reads features from the clean branch (default route), the AdvProp convention.
+    state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
+    load_state_dict_auto(pre_model, state, strict=True)
 
     _set_encoder_eval_and_freeze(pre_model)
 

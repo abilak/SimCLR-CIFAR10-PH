@@ -39,6 +39,7 @@ from torchvision.models import resnet18, resnet34
 
 from omegaconf import OmegaConf
 from models import SimCLR
+from phtopo.dual_bn import load_state_dict_auto
 
 
 def _sanitize_dgm_np(dgm: np.ndarray) -> np.ndarray:
@@ -202,7 +203,7 @@ def main():
         cfg = OmegaConf.to_container(cfg, resolve=True)
 
     model = build_model_from_ckpt_config(cfg)
-    model.load_state_dict(ckpt["model"], strict=True)
+    load_state_dict_auto(model, ckpt["model"], strict=True)  # dual-BN-aware
     model.to(device)
     model.eval()
 

@@ -68,6 +68,33 @@ def test_multiscale():
     print("[OK] multiscale (layer3+layer2): maps + finite loss + grad for 4 methods")
 
 
+def test_ph_maps_only_equivalence_and_skips_layer4():
+    torch.manual_seed(11)
+    x = torch.rand(6, 3, 32, 32, requires_grad=True)
+    # single-scale (layer3): ph_maps_only must equal the full forward's PH map exactly
+    m = _model().eval()
+    full = m(x)[0]
+    only = m.ph_maps_only(x)
+    assert len(only) == 1 and torch.equal(full, only[0]), "ph_maps_only != full forward (single scale)"
+    # and it must NOT execute layer4 (the skipped, expensive block)
+    calls = {"n": 0}
+    h = m.layer4.register_forward_hook(lambda *a: calls.__setitem__("n", calls["n"] + 1))
+    try:
+        _ = m.ph_maps_only(x); assert calls["n"] == 0, "ph_maps_only ran layer4 (no speedup)"
+        _ = m(x);              assert calls["n"] == 1, "full forward should run layer4"
+    finally:
+        h.remove()
+    # multiscale (layer3+layer2): identical to ph_maps()'s map list
+    mm = _model(extra=("layer2",)).eval()
+    ref = mm.ph_maps(x)[0]
+    got = mm.ph_maps_only(x)
+    assert len(got) == 2 and all(torch.equal(a, b) for a, b in zip(ref, got)), "multiscale maps differ"
+    # gradient flows to the input through ph_maps_only
+    mm.ph_maps_only(x)[0].pow(2).sum().backward()
+    assert x.grad is not None and float(x.grad.abs().sum()) > 0, "no grad through ph_maps_only"
+    print("[OK] ph_maps_only: bit-identical to full forward, skips layer4, grad flows (single+multiscale)")
+
+
 def test_consistency_semantics():
     torch.manual_seed(3)
     h = torch.randn(6, 8, 4, 4)
@@ -124,6 +151,7 @@ if __name__ == "__main__":
     test_pgd_ascent_increases_and_bounded()
     test_all_methods_finite_grad_bn_restored()
     test_multiscale()
+    test_ph_maps_only_equivalence_and_skips_layer4()
     test_consistency_semantics()
     test_checkpoint_roundtrips()
     test_ema_teacher_consistency()

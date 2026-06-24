@@ -34,6 +34,7 @@ from torchvision.models import resnet18, resnet34
 
 from models import SimCLR
 from phtopo.robustness import run_robustness_suite
+from phtopo.dual_bn import load_state_dict_auto
 
 
 def build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device,
@@ -71,7 +72,9 @@ def load_encoder_from_ckpt(path, device):
     enc = build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device,
                         ph_source_layer=ph_source_layer, ph_extra_layers=ph_extra_layers)
     state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-    enc.load_state_dict(state, strict=True)
+    # Auto-converts the encoder to dual-BN iff the checkpoint is dual-BN (then the
+    # clean branch -- default route -- is used for the frozen-feature eval).
+    load_state_dict_auto(enc, state, strict=True)
     for p in enc.parameters():
         p.requires_grad = False
     enc.eval()
