@@ -1,5 +1,12 @@
 import torch.nn as nn
 import torch
+from torchvision.models import resnet18, resnet34, resnet50
+
+# Shared backbone registry (CNNs via torchvision). resnet50 uses Bottleneck blocks
+# (4x channel expansion) -- SimCLR derives the PH source-layer channels from the
+# backbone, so it works for any depth. ViT backbones (timm) are added separately
+# when that path is enabled (they need a different PH point-cloud extraction).
+BACKBONES = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
 
 # -------------------------
 # Model
@@ -42,7 +49,17 @@ class SimCLR(nn.Module):
         self.layer4 = backbone.layer4
         self.avgpool = backbone.avgpool
 
-        self.feature_dim = backbone.fc.in_features  # 512 for resnet18/34
+        self.feature_dim = backbone.fc.in_features  # 512 for resnet18/34, 2048 for resnet50
+
+        # Per-stage channel counts depend on the block type: BasicBlock (resnet18/34)
+        # has expansion 1 -> (64,128,256,512); Bottleneck (resnet50+) has expansion 4
+        # -> (256,512,1024,2048). Derive them from the actual backbone so the PH
+        # 1x1 reduce conv has the right in-channels for ANY resnet depth.
+        expansion = backbone.layer1[0].expansion
+        self._layer_channels = {
+            name: base * expansion
+            for name, base in zip(self._LAYER_ORDER, [64, 128, 256, 512])
+        }
 
         self.projector = nn.Sequential(
             nn.Linear(self.feature_dim, proj_hidden_dim),
@@ -52,9 +69,9 @@ class SimCLR(nn.Module):
 
         # PH map is taken from `ph_source_layer`. layer3 -> 4x4=16 points (default),
         # layer2 -> 8x8=64 points (richer, supports H1). The 1x1 conv reduces channels.
-        assert ph_source_layer in self._LAYER_CHANNELS, f"bad ph_source_layer {ph_source_layer}"
+        assert ph_source_layer in self._layer_channels, f"bad ph_source_layer {ph_source_layer}"
         self.ph_source_layer = ph_source_layer
-        in_ch = self._LAYER_CHANNELS[ph_source_layer]
+        in_ch = self._layer_channels[ph_source_layer]
         self.ph_reduce = nn.Conv2d(in_ch, reduce_channels, kernel_size=1, bias=False)
 
         # Optional extra layers for MULTISCALE PH (persistence at several network
@@ -62,7 +79,7 @@ class SimCLR(nn.Module):
         # only have `ph_reduce`) still load with strict=True.
         self.ph_extra_layers = tuple(ph_extra_layers)
         self.ph_reduce_extra = nn.ModuleDict({
-            L: nn.Conv2d(self._LAYER_CHANNELS[L], reduce_channels, kernel_size=1, bias=False)
+            L: nn.Conv2d(self._layer_channels[L], reduce_channels, kernel_size=1, bias=False)
             for L in self.ph_extra_layers
         })
 

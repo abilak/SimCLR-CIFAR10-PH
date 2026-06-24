@@ -29,17 +29,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torchvision import transforms
-from torchvision.datasets import CIFAR10
-from torchvision.models import resnet18, resnet34
 
-from models import SimCLR
+from models import SimCLR, BACKBONES
+from datasets import make_eval_sets, num_classes as ds_num_classes, label_of
 from phtopo.robustness import run_robustness_suite
 from phtopo.dual_bn import load_state_dict_auto
 
 
 def build_encoder(backbone, projection_dim, proj_hidden_dim, reduce_channels, device,
                   ph_source_layer="layer4", ph_extra_layers=()):
-    base = resnet18 if backbone == "resnet18" else resnet34
+    base = BACKBONES[backbone]
     m = SimCLR(base, projection_dim=projection_dim, proj_hidden_dim=proj_hidden_dim,
                reduce_channels=reduce_channels, cifar_no_maxpool=True,
                ph_source_layer=ph_source_layer, ph_extra_layers=tuple(ph_extra_layers)).to(device)
@@ -97,19 +96,18 @@ def train_linear_probe(model, train_loader, device, epochs, lr):
     return model
 
 
-def make_loaders(data_dir, batch_size, per_class, workers):
-    tf = transforms.Compose([transforms.ToTensor()])  # [0,1], attacks operate here
-    train = CIFAR10(root=data_dir, train=True, transform=tf, download=True)
-    test = CIFAR10(root=data_dir, train=False, transform=tf, download=True)
-    # small labeled probe set
-    idx_by_class = {c: [] for c in range(10)}
+def make_loaders(data_dir, batch_size, per_class, workers, dataset="cifar10"):
+    train, test = make_eval_sets(dataset, root=data_dir, download=True)  # [0,1], attacks operate here
+    nc = ds_num_classes(dataset)
+    # small balanced labeled probe set (reads labels directly -- no image decode)
+    idx_by_class = {c: [] for c in range(nc)}
     for i in range(len(train)):
-        _, y = train[i]
+        y = label_of(train, i)
         if len(idx_by_class[y]) < per_class:
             idx_by_class[y].append(i)
         if all(len(v) >= per_class for v in idx_by_class.values()):
             break
-    indices = [i for c in range(10) for i in idx_by_class[c]]
+    indices = [i for c in range(nc) for i in idx_by_class[c]]
     train_loader = DataLoader(train, batch_size=batch_size,
                               sampler=SubsetRandomSampler(indices), num_workers=workers)
     test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=workers)
@@ -131,22 +129,25 @@ def main():
                     help="limit test batches for the (expensive) attack suite")
     ap.add_argument("--no_autoattack", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--dataset", default="cifar10", help="cifar10 | cifar100 | stl10")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[robustness] device={device}")
 
-    train_loader, test_loader = make_loaders(args.data_dir, args.batch_size, args.probe_per_class, args.workers)
+    n_cls = ds_num_classes(args.dataset)
+    train_loader, test_loader = make_loaders(args.data_dir, args.batch_size, args.probe_per_class,
+                                             args.workers, dataset=args.dataset)
 
     enc, feat_dim = load_encoder_from_ckpt(args.ckpt, device)
-    model = LinearEvalModel(enc, feat_dim).to(device)
-    print("[robustness] training linear probe ...")
+    model = LinearEvalModel(enc, feat_dim, n_classes=n_cls).to(device)
+    print(f"[robustness] dataset={args.dataset} ({n_cls} classes); training linear probe ...")
     train_linear_probe(model, train_loader, device, args.probe_epochs, args.probe_lr)
 
     surrogate = None
     if args.surrogate_ckpt:
         senc, sfeat = load_encoder_from_ckpt(args.surrogate_ckpt, device)
-        surrogate = LinearEvalModel(senc, sfeat).to(device)
+        surrogate = LinearEvalModel(senc, sfeat, n_classes=n_cls).to(device)
         print("[robustness] training surrogate probe (for transfer) ...")
         train_linear_probe(surrogate, train_loader, device, args.probe_epochs, args.probe_lr)
 

@@ -37,12 +37,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from torchvision.datasets import CIFAR10
 from torchvision import transforms
-from torchvision.models import resnet18, resnet34
 from tqdm import tqdm
 
-from models import SimCLR
+from models import SimCLR, BACKBONES
+from datasets import make_eval_sets, num_classes as ds_num_classes, image_size as ds_image_size, label_of
 from phtopo.dual_bn import load_state_dict_auto
 
 logger = logging.getLogger(__name__)
@@ -354,24 +353,27 @@ def finetune(args: DictConfig) -> None:
         viz_dir=viz_dir
     )
 
-    # dataset
+    # dataset (registry-driven; crop sized to the dataset; default cifar10)
+    dataset_name = str(getattr(args, "dataset", "cifar10")).lower()
+    img_sz = ds_image_size(dataset_name)
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(32),
+        transforms.RandomResizedCrop(img_sz),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
     ])
     test_transform = transforms.Compose([transforms.ToTensor()])
 
     data_dir = hydra.utils.to_absolute_path(args.data_dir)
-    train_set = CIFAR10(root=data_dir, train=True, transform=train_transform, download=True)
-    test_set  = CIFAR10(root=data_dir, train=False, transform=test_transform, download=True)
+    train_set, test_set = make_eval_sets(dataset_name, root=data_dir, download=True)
+    train_set.transform = train_transform   # augmented probe-train; test stays ToTensor
+    test_set.transform = test_transform
 
     # labeled subset
-    n_classes = 10
+    n_classes = ds_num_classes(dataset_name)
     per_class = int(getattr(args.lin, "per_class", 10))
     idx_by_class = {c: [] for c in range(n_classes)}
     for i in range(len(train_set)):
-        _, y = train_set[i]
+        y = label_of(train_set, i)   # read label directly (no image decode)
         if len(idx_by_class[y]) < per_class:
             idx_by_class[y].append(i)
         if all(len(v) >= per_class for v in idx_by_class.values()):
@@ -394,8 +396,8 @@ def finetune(args: DictConfig) -> None:
     )
 
     # backbone
-    assert args.backbone in ["resnet18", "resnet34"]
-    base_encoder = resnet18 if args.backbone == "resnet18" else resnet34
+    assert args.backbone in BACKBONES, f"backbone must be one of {sorted(BACKBONES)}"
+    base_encoder = BACKBONES[args.backbone]
 
     # checkpoint path (robust)
     ckpt_path = getattr(args, "ckpt_path", None)

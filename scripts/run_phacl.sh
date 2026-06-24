@@ -47,9 +47,12 @@ ckpt_path () {  # method seed epoch -> path
   echo "$OUT/upstream/${1}_seed${2}/checkpoints/upstream/${1}/seed${2}/epoch${3}/simclr_${1}_${BACKBONE}_epoch${3}_seed${2}.pt"
 }
 
-# ---- Train ----------------------------------------------------------------
+# ---- Train (skip if final checkpoint exists; runs auto-resume otherwise) ----
 for seed in "${SEEDS[@]}"; do
   for m in "${METHODS[@]}"; do
+    if [[ -f "$(ckpt_path "$m" "$seed" "$EPOCHS")" ]]; then
+      echo "==== SKIP train $m seed=$seed (final checkpoint exists) ===="; continue
+    fi
     rd="$OUT/upstream/${m}_seed${seed}"
     echo "==== TRAIN $m seed=$seed ===="
     $PY simclr.py method="$m" backbone="$BACKBONE" seed="$seed" \
@@ -65,20 +68,26 @@ done
 for seed in "${SEEDS[@]}"; do
   surr=$(ckpt_path baseline "$seed" "$EPOCHS")
   for m in "${METHODS[@]}"; do
+    out_json="$OUT/robustness/${m}_seed${seed}.json"
+    if [[ -f "$out_json" ]]; then echo "==== SKIP robustness $m seed=$seed (json exists) ===="; continue; fi
     ck=$(ckpt_path "$m" "$seed" "$EPOCHS")
+    [[ -f "$ck" ]] || { echo "  (no checkpoint for $m seed=$seed yet)"; continue; }
     echo "==== ROBUSTNESS $m seed=$seed ===="
-    $PY eval_robustness.py --ckpt "$ck" --surrogate_ckpt "$surr" \
-        --eps_px "$EPS_PX" --out "$OUT/robustness/${m}_seed${seed}.json" \
+    surr_arg=(); [[ -f "$surr" && "$m" != "baseline" ]] && surr_arg=(--surrogate_ckpt "$surr")
+    $PY eval_robustness.py --ckpt "$ck" "${surr_arg[@]}" \
+        --eps_px "$EPS_PX" --out "$out_json" \
         --max_test_batches 8      # remove for full test set (final numbers)
   done
 done
 
 # ---- Mechanism (#3): topology under attack, all seeds ----------------------
 for seed in "${SEEDS[@]}"; do
+  [[ -f "$OUT/mechanism/seed${seed}/mechanism.json" ]] && { echo "==== SKIP mechanism seed=$seed ===="; continue; }
   args=()
   for m in "${METHODS[@]}"; do
-    args+=(--ckpt "$m=$(ckpt_path "$m" "$seed" "$EPOCHS")")
+    ck=$(ckpt_path "$m" "$seed" "$EPOCHS"); [[ -f "$ck" ]] && args+=(--ckpt "$m=$ck")
   done
+  [[ ${#args[@]} -eq 0 ]] && { echo "  (no checkpoints for seed=$seed yet)"; continue; }
   $PY eval_mechanism.py "${args[@]}" --out "$OUT/mechanism/seed${seed}" --eps_px "$EPS_PX" --per_class 80
 done
 

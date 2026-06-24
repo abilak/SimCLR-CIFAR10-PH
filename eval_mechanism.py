@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 from eval_robustness import (
     load_encoder_from_ckpt, LinearEvalModel, train_linear_probe, make_loaders,
 )
+from datasets import num_classes as ds_num_classes
 from phtopo.attacks import pgd_linf
 from phtopo.descriptors import topology_descriptors, class_separation_gamma
 
@@ -48,10 +49,10 @@ def encoder_features(enc, x):
     return h
 
 
-def gather_class_features(enc, probe, loader, device, per_class, eps, attacked):
+def gather_class_features(enc, probe, loader, device, per_class, eps, attacked, n_classes=10):
     """Collect up to per_class encoder features per class, clean or PGD-attacked."""
     feats = defaultdict(list)
-    need = {c: per_class for c in range(10)}
+    need = {c: per_class for c in range(n_classes)}
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         if attacked:
@@ -90,6 +91,7 @@ def main():
     ap.add_argument("--probe_per_class", type=int, default=500)
     ap.add_argument("--probe_epochs", type=int, default=20)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--dataset", default="cifar10", help="cifar10 | cifar100 | stl10")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -97,18 +99,20 @@ def main():
     eps = args.eps_px / 255.0
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
-    train_loader, test_loader = make_loaders(args.data_dir, 256, args.probe_per_class, args.workers)
+    n_cls = ds_num_classes(args.dataset)
+    train_loader, test_loader = make_loaders(args.data_dir, 256, args.probe_per_class,
+                                             args.workers, dataset=args.dataset)
 
     results = {}
     for spec in args.ckpt:
         method, path = spec.split("=", 1)
         print(f"[mechanism] {method}: {path}")
         enc, feat_dim = load_encoder_from_ckpt(path, device)
-        probe = LinearEvalModel(enc, feat_dim).to(device)
+        probe = LinearEvalModel(enc, feat_dim, n_classes=n_cls).to(device)
         train_linear_probe(probe, train_loader, device, args.probe_epochs, 0.1)
 
-        clean = gather_class_features(enc, probe, test_loader, device, args.per_class, eps, attacked=False)
-        adv = gather_class_features(enc, probe, test_loader, device, args.per_class, eps, attacked=True)
+        clean = gather_class_features(enc, probe, test_loader, device, args.per_class, eps, attacked=False, n_classes=n_cls)
+        adv = gather_class_features(enc, probe, test_loader, device, args.per_class, eps, attacked=True, n_classes=n_cls)
         s_clean = descriptor_summary(clean)
         s_adv = descriptor_summary(adv)
         g_drop = (s_clean["gamma"] - s_adv["gamma"]) / max(1e-9, s_clean["gamma"])

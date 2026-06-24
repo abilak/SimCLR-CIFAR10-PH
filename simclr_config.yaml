@@ -5,10 +5,13 @@
 
 data_dir: ./data
 
+# dataset: cifar10 | cifar100 | stl10  (stl10 = 96x96, SSL on the unlabeled split)
+dataset: cifar10
+
 # device: auto | cuda | mps | cpu  (auto picks cuda>mps>cpu)
 device: auto
 
-# backbone: resnet18 | resnet34
+# backbone: resnet18 | resnet34 | resnet50
 backbone: resnet18
 
 batch_size: 128
@@ -35,6 +38,8 @@ method: baseline
 train:
   max_steps: 200        # set -1 for full epoch
   warmup_epochs: 0     # baseline warmup even if method=phsim/hybrid
+  resume: true          # auto-resume from the latest checkpoint for this (method,seed)
+                        # if present (crash / spot-preemption safe). set false to force restart.
 
 optim:
   lr_min: 1e-3

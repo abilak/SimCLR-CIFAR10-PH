@@ -21,3 +21,11 @@ gudhi>=3.8            # fast C++ Vietoris-Rips for H0/H1 eval diagnostics
 # Robustness evaluation (Tier-1 #1) -- install on the run machine for AutoAttack:
 #   pip install git+https://github.com/fra31/auto-attack
 autoattack @ git+https://github.com/fra31/auto-attack.git
+
+# Program expansion (see PROGRAM.md). Optional -- only needed for the deferred axes:
+#   timm    -> ViT-S backbone (architecture check, item 7)
+#   lightly -> MoCo / BYOL / SimSiam framework components (item 6)
+# The realistic program (CIFAR-10/100, STL-10, ResNet-18/34/50, the 6 methods)
+# needs NONE of these -- it runs on the core deps above.
+# timm>=1.0
+# lightly>=1.5

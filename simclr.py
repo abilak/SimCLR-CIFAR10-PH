@@ -31,10 +31,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
-from torchvision.models import resnet18, resnet34
+from torchvision.models import resnet18, resnet34, resnet50
 from tqdm import tqdm
 
-from models import SimCLR
+from models import SimCLR, BACKBONES
+from datasets import make_ssl_trainset, make_eval_sets, num_classes as ds_num_classes
 from phtopo.losses import (
     topo_separation_loss, raw_sw_separation_loss,
     topo_consistency_loss, raw_consistency_loss,
@@ -138,6 +139,7 @@ def eval_gamma_class_separation(
     w_h0: float = 0.2,
     w_h1: float = 1.0,
     maxdim: int = 1,
+    dataset: str = "cifar10",
 ) -> float:
     """
     Evaluation-only proxy for Γ(f):
@@ -146,10 +148,10 @@ def eval_gamma_class_separation(
     - For each class, compute persistence diagrams (H0/H1) on the class point cloud in feature space.
     - Return average weighted Wasserstein distance over all class pairs.
     """
-    test_transform = transforms.Compose([transforms.ToTensor()])
-    test_set = CIFAR10(root=data_dir, train=False, transform=test_transform, download=True)
+    nc = ds_num_classes(dataset)
+    _, test_set = make_eval_sets(dataset, root=data_dir, download=True)
 
-    idx_by_class = {c: [] for c in range(10)}
+    idx_by_class = {c: [] for c in range(nc)}
     for idx in range(len(test_set)):
         _, y = test_set[idx]
         if len(idx_by_class[y]) < per_class:
@@ -157,11 +159,11 @@ def eval_gamma_class_separation(
         if all(len(v) >= per_class for v in idx_by_class.values()):
             break
 
-    indices = [i for c in range(10) for i in idx_by_class[c]]
+    indices = [i for c in range(nc) for i in idx_by_class[c]]
     subset = Subset(test_set, indices)
     loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    feats = {c: [] for c in range(10)}
+    feats = {c: [] for c in range(nc)}
     model.eval()
     for x, y in loader:
         x = x.to(device)
@@ -171,7 +173,7 @@ def eval_gamma_class_separation(
         for i, c in enumerate(y):
             feats[int(c)].append(h_np[i])
 
-    feats_by_class = {c: np.stack(feats[c], axis=0) for c in range(10) if len(feats[c]) > 0}
+    feats_by_class = {c: np.stack(feats[c], axis=0) for c in range(nc) if len(feats[c]) > 0}
     # Fast GUDHI (H0/H1) + sliced-Wasserstein; same SW functional as training.
     return class_separation_gamma(
         feats_by_class, w_h0=float(w_h0), w_h1=float(w_h1), maxdim=maxdim
@@ -421,6 +423,23 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
     raise ValueError(f"Unknown method={method}. Use one of {sorted(ALL_METHODS)}.")
 
 
+def _find_latest_ckpt(ckpt_dir, method, backbone, seed):
+    """
+    Return (epoch, path) of the highest-epoch checkpoint under ckpt_dir for this
+    (method, backbone, seed), or (0, None) if none. Used to resume a run that was
+    interrupted (crash / spot preemption) from its last saved epoch instead of
+    restarting from scratch.
+    """
+    import glob, re
+    pat = os.path.join(ckpt_dir, "epoch*", f"simclr_{method}_{backbone}_epoch*_seed{seed}.pt")
+    best_e, best_p = 0, None
+    for p in glob.glob(pat):
+        mobj = re.search(r"epoch(\d+)_seed", os.path.basename(p))
+        if mobj and int(mobj.group(1)) > best_e:
+            best_e, best_p = int(mobj.group(1)), p
+    return best_e, best_p
+
+
 @torch.no_grad()
 def ema_update(ema_model, model, momentum: float):
     """
@@ -479,16 +498,15 @@ def train(args: DictConfig) -> None:
 
     hist = HistoryLogger(out_dir=log_dir, filename=f"{args.method}_seed{args.seed}_train_history.csv")
 
-    # Data
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(32),
-        transforms.RandomHorizontalFlip(p=0.5),
-        get_color_distortion(s=float(args.aug.color_strength)),
-        transforms.ToTensor(),
-    ])
-
+    # Data. The two-views SSL set is built per-dataset (crop sized to the dataset);
+    # default cifar10 reproduces the original 32x32 pipeline. Attacks operate in
+    # [0,1] (ToTensor only), unchanged across datasets.
     data_dir = hydra.utils.to_absolute_path(args.data_dir)
-    train_set = CIFAR10Pair(root=data_dir, train=True, transform=train_transform, download=True)
+    dataset_name = str(getattr(args, "dataset", "cifar10")).lower()
+    train_set = make_ssl_trainset(
+        dataset_name, root=data_dir,
+        color_strength=float(args.aug.color_strength), download=True,
+    )
 
     if int(args.data.subset_size) > 0:
         train_set = Subset(train_set, range(int(args.data.subset_size)))
@@ -502,8 +520,8 @@ def train(args: DictConfig) -> None:
     )
 
     # Model
-    assert args.backbone in ["resnet18", "resnet34"]
-    base_encoder = resnet18 if args.backbone == "resnet18" else resnet34
+    assert args.backbone in BACKBONES, f"backbone must be one of {sorted(BACKBONES)}"
+    base_encoder = BACKBONES[args.backbone]
 
     ph_extra_layers = tuple(getattr(args.ph, "extra_layers", []) or [])
     model = SimCLR(
@@ -626,7 +644,39 @@ def train(args: DictConfig) -> None:
 
     tag = f"{args.method}_{args.backbone}_seed{args.seed}"
 
-    for epoch in range(1, int(args.epochs) + 1):
+    # -------------------------
+    # Resume (crash / spot-preemption safe): continue from the latest checkpoint
+    # for this (method, backbone, seed). Restores model, optimizer, scheduler, EMA
+    # teacher, and RNG so the LR schedule and momentum buffers continue cleanly.
+    # -------------------------
+    start_epoch = 1
+    if bool(getattr(args.train, "resume", True)):
+        last_e, last_p = _find_latest_ckpt(ckpt_dir, args.method, args.backbone, args.seed)
+        if last_p is not None and last_e >= int(args.epochs):
+            logger.info(f"[resume] run already complete at epoch {last_e}; nothing to do.")
+            return
+        if last_p is not None:
+            ck = torch.load(last_p, map_location=device)
+            load_state_dict_auto(model, ck["model"], strict=True)
+            if ck.get("optimizer") is not None:
+                optimizer.load_state_dict(ck["optimizer"])
+            if ck.get("scheduler") is not None:
+                scheduler.load_state_dict(ck["scheduler"])
+            if ema_model is not None and ck.get("ema") is not None:
+                load_state_dict_auto(ema_model, ck["ema"], strict=True)
+            rng = ck.get("rng")
+            if rng is not None:
+                try:
+                    torch.set_rng_state(rng["torch"])
+                    np.random.set_state(rng["numpy"])
+                    if device == "cuda" and rng.get("cuda") is not None:
+                        torch.cuda.set_rng_state_all(rng["cuda"])
+                except Exception as e:
+                    logger.warning(f"[resume] could not restore RNG state: {e}")
+            start_epoch = int(ck["epoch"]) + 1
+            logger.info(f"[resume] from epoch {ck['epoch']} ({last_p}); continuing at epoch {start_epoch}")
+
+    for epoch in range(start_epoch, int(args.epochs) + 1):
         loss_meter = AverageMeter("loss")
         bar = tqdm(train_loader, total=steps_per_epoch)
 
@@ -681,10 +731,21 @@ def train(args: DictConfig) -> None:
         # Save checkpoint on schedule
         # -------------------------
         if epoch % save_every == 0:
+            # Persist optimizer/scheduler/EMA/RNG too so a resumed run continues the
+            # LR schedule + momentum buffers exactly. Eval loaders read only ck["model"],
+            # so these extra keys are backward-compatible.
             ckpt = {
                 "model": model.state_dict(),
                 "config": OmegaConf.to_container(args, resolve=True),
                 "epoch": epoch,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "ema": ema_model.state_dict() if ema_model is not None else None,
+                "rng": {
+                    "torch": torch.get_rng_state(),
+                    "numpy": np.random.get_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if device == "cuda" else None,
+                },
             }
             ckpt_name = f"simclr_{args.method}_{args.backbone}_epoch{epoch}_seed{args.seed}.pt"
             epoch_ckpt_dir = os.path.join(ckpt_dir, f"epoch{epoch}")
@@ -712,6 +773,7 @@ def train(args: DictConfig) -> None:
                 w_h0=float(getattr(args.ph, "w_h0", 0.2)),
                 w_h1=float(getattr(args.ph, "w_h1", 1.0)),
                 maxdim=1,
+                dataset=dataset_name,
             )
             model.train()
 
