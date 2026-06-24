@@ -196,7 +196,7 @@ def main():
         else "cpu"
     )
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     cfg = ckpt.get("config", {})
     if not isinstance(cfg, dict):
         # Sometimes OmegaConf container might appear already resolved; keep it safe:

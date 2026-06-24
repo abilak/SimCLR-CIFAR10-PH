@@ -58,7 +58,7 @@ class LinearEvalModel(nn.Module):
 
 
 def load_encoder_from_ckpt(path, device):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)  # our own ckpt (has cfg/RNG)
     cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
     backbone = cfg.get("backbone", "resnet18")
     projection_dim = int(cfg.get("projection_dim", 64))

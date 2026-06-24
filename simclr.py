@@ -656,7 +656,7 @@ def train(args: DictConfig) -> None:
             logger.info(f"[resume] run already complete at epoch {last_e}; nothing to do.")
             return
         if last_p is not None:
-            ck = torch.load(last_p, map_location=device)
+            ck = torch.load(last_p, map_location=device, weights_only=False)  # our own ckpt (has cfg/RNG)
             load_state_dict_auto(model, ck["model"], strict=True)
             if ck.get("optimizer") is not None:
                 optimizer.load_state_dict(ck["optimizer"])

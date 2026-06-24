@@ -128,7 +128,7 @@ def train(args, device):
             print(f"[adv_sup] already complete at epoch {e}")
             return os.path.join(args.ckpt_dir, f"epoch{args.epochs}.pt")
         if p is not None:
-            ck = torch.load(p, map_location=device)
+            ck = torch.load(p, map_location=device, weights_only=False)
             model.load_state_dict(ck["model"]); opt.load_state_dict(ck["optimizer"])
             sched.load_state_dict(ck["scheduler"]); start_epoch = ck["epoch"] + 1
             print(f"[adv_sup] resume from epoch {ck['epoch']} -> {start_epoch}")
@@ -174,7 +174,7 @@ def evaluate(args, device, ckpt_path):
     _, test_set = make_eval_sets(args.dataset, root=args.data_dir, download=True)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     model = make_classifier(args.backbone, nc).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=False)["model"])
     model.eval()
     res = run_robustness_suite(model, test_loader, device, eps=args.eps_px / 255.0,
                                run_autoattack=not args.no_autoattack, max_batches=args.max_test_batches)

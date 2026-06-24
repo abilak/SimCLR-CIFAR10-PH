@@ -415,7 +415,7 @@ def finetune(args: DictConfig) -> None:
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Upstream checkpoint not found: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)  # our own ckpt (has cfg/RNG)
     # Build the encoder to MATCH the checkpoint's PH source layer (the 1x1 ph_reduce
     # conv's in-channels depend on it). Old checkpoints predate this option -> layer4.
     ckpt_cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
