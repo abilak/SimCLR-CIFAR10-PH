@@ -20,6 +20,28 @@ concurrently if you get a second GPU.
 - **AdvCL** is covered: `adv_baseline` + `adv.dual_bn=true` IS the AdvCL recipe
   (adversarial SimCLR + dual-BN) — label that row "AdvCL (ours, dual-BN)".
 
+## Evaluation protocol — CRITICAL (read before reporting any number)
+Dual-BN / AdvProp models must be evaluated through the **adv-BN branch** with a
+**robust linear probe** (head trained on PGD), or robustness reads ~0% even on a
+genuinely robust model. Proven on `adv_baseline` (300 ep, cifar10, seed0):
+
+| probe × branch | clean | PGD-100 @ ε=8 |
+|---|---|---|
+| clean / clean-BN (naive default) | 0.757 | **0.031** ← the artifact |
+| clean / adv-BN | 0.586 | 0.224 |
+| robust / adv-BN | 0.567 | **0.287** ← real robustness |
+
+So always evaluate with `--robust_probe --bn_branch adv` (the launcher now defaults
+`ROBUST_PROBE=true BN_BRANCH=adv`). Report the **adv-BN operating point**
+(clean≈57% / robust≈29% here) as the robust model — AdvProp/AdvCL convention; the
+clean-BN branch is the high-clean / low-robust operating point. Confirm every
+headline number with **AutoAttack** (PGD over-estimates): drop `--no_autoattack`,
+`--max_test_batches -1`.
+
+**Re-evaluate the 50-epoch pilot `topoacl`/`rawacl` checkpoints under this protocol**
+as a quick sanity check — but they're undertrained (clean ~62%), so the *headline*
+topology comparison needs fresh 300-epoch runs (below).
+
 ## Not yet built (see "Build next" — do NOT assume these run yet)
 - **RoCL** (Kim et al. [20]) exact port + (optionally) the *official* AdvCL — need
   their GitHub repos cloned on the box (item 8 head-to-head).
@@ -35,25 +57,35 @@ python -c "import torch; print(torch.cuda.is_available())"   # expect True
 
 ## Run order (single GPU)
 
-### Phase 0 — pilot (RUNNING NOW). Gate.
-`scripts/run_phacl.sh` with the focused config (4 methods, 1 seed, 50 ep, steps=3,
-dual-BN). Decision gate before spending the big compute:
-- `adv_baseline` robust acc jumps off ~3% → adversarial training + dual-BN works.
-- `topoacl` ≥ `rawacl` (robustness & topology stability) and `topoacl` clean acc
-  near baseline → topology earns its place.
-- If both hold → proceed to Phase 1. If not → you have a clean negative (theory +
-  mechanism + controls), still a paper.
+### Phase 0 — DONE. Gate passed (after fixing the eval protocol).
+The 50-ep pilot read ~0% robust for everything — but that was the clean-BN/clean-probe
+artifact. Re-measured correctly, `adv_baseline` at **300 ep reaches ~29% PGD-100**
+(adv-BN + robust probe), confirming adversarial training + dual-BN works. The
+mechanism test (`topoacl` Γ-drop −0.3% vs `rawacl` −12%) already shows the
+topology-specific effect. → proceed to the headline matrix.
 
-### Phase 1 — CIFAR-10 home matrix (~7 days). The main result.
+### Phase 1 — CIFAR-10 home matrix (THE main result). ~300 ep, corrected protocol.
+**Headline config** — the proven setup where robustness actually exists (300 ep is
+the confirmed point; 200 may undertrain robustness). The launcher defaults
+`ROBUST_PROBE=true BN_BRANCH=adv`, so every method is measured on the protocol that
+exposes robustness:
 ```bash
 DATASET=cifar10 BACKBONE=resnet18 \
   METHODS="baseline adv_baseline adv_phsim adv_swcontrol topoacl rawacl" \
   SUPERVISED="pgd_at trades" \
-  SEEDS="0 1 2" EPOCHS=200 ADV_STEPS=5 DUAL_BN=true MAX_TEST_BATCHES=-1 \
+  SEEDS="0 1 2" EPOCHS=300 SAVE_EVERY=100 WARMUP=10 ADV_STEPS=5 DUAL_BN=true \
+  MAX_TEST_BATCHES=-1 \
   bash scripts/run_program.sh
 ```
-This produces ONE robustness table with: baseline, adv_baseline (= **AdvCL**,
-dual-BN), adv_phsim, adv_swcontrol, topoacl, rawacl, **PGD-AT**, **TRADES**.
+Disk: checkpoints are now **slim (model-only milestones + one rolling `last.pt`** for
+resume), ~67% smaller. With `SAVE_EVERY=100` the whole 6-method × 3-seed matrix is
+~5–7 GB — fits the shared disk. Before launching, free space (`conda clean -a -y`,
+delete the pilot + any old fat intermediate checkpoints) and check `df -h .`.
+This produces ONE robustness table (full test set + AutoAttack, adv-BN + robust
+probe) with: baseline, adv_baseline (= **AdvCL**, dual-BN), adv_phsim, adv_swcontrol,
+topoacl, rawacl, **PGD-AT**, **TRADES**. **The decisive cells:** `topoacl` vs `rawacl`
+(topology-specific?) and `topoacl` vs `adv_baseline` (beats plain ACL?) on robust
+accuracy — now measurable because robustness exists in this regime.
 (3 seeds, not 5 — see the deadline math; 3 seeds buys a second dataset, which a
 reviewer values more than 2 extra seeds.) Add the **RoCL** row once that port is
 built (next).

@@ -649,14 +649,17 @@ def train(args: DictConfig) -> None:
     # for this (method, backbone, seed). Restores model, optimizer, scheduler, EMA
     # teacher, and RNG so the LR schedule and momentum buffers continue cleanly.
     # -------------------------
+    last_full_path = os.path.join(ckpt_dir, "last.pt")
     start_epoch = 1
     if bool(getattr(args.train, "resume", True)):
         last_e, last_p = _find_latest_ckpt(ckpt_dir, args.method, args.backbone, args.seed)
-        if last_p is not None and last_e >= int(args.epochs):
+        if last_e >= int(args.epochs) and last_e > 0:
             logger.info(f"[resume] run already complete at epoch {last_e}; nothing to do.")
             return
-        if last_p is not None:
-            ck = torch.load(last_p, map_location=device, weights_only=False)  # our own ckpt (has cfg/RNG)
+        if os.path.exists(last_full_path):
+            # Full resume state (model + optimizer + scheduler + EMA + RNG) lives in
+            # the single rolling last.pt; milestone checkpoints are model-only (slim).
+            ck = torch.load(last_full_path, map_location=device, weights_only=False)
             load_state_dict_auto(model, ck["model"], strict=True)
             if ck.get("optimizer") is not None:
                 optimizer.load_state_dict(ck["optimizer"])
@@ -674,7 +677,15 @@ def train(args: DictConfig) -> None:
                 except Exception as e:
                     logger.warning(f"[resume] could not restore RNG state: {e}")
             start_epoch = int(ck["epoch"]) + 1
-            logger.info(f"[resume] from epoch {ck['epoch']} ({last_p}); continuing at epoch {start_epoch}")
+            logger.info(f"[resume] full state from last.pt @ epoch {ck['epoch']}; continuing at {start_epoch}")
+        elif last_p is not None:
+            # No last.pt (e.g. older run): fall back to the slim milestone -- model
+            # resumes, but optimizer/scheduler/RNG restart from scratch.
+            ck = torch.load(last_p, map_location=device, weights_only=False)
+            load_state_dict_auto(model, ck["model"], strict=True)
+            start_epoch = int(ck["epoch"]) + 1
+            logger.warning(f"[resume] no last.pt; model-only from {last_p} @ epoch {ck['epoch']} "
+                           f"(optimizer/scheduler/RNG reset); continuing at {start_epoch}")
 
     for epoch in range(start_epoch, int(args.epochs) + 1):
         loss_meter = AverageMeter("loss")
@@ -731,28 +742,34 @@ def train(args: DictConfig) -> None:
         # Save checkpoint on schedule
         # -------------------------
         if epoch % save_every == 0:
-            # Persist optimizer/scheduler/EMA/RNG too so a resumed run continues the
-            # LR schedule + momentum buffers exactly. Eval loaders read only ck["model"],
-            # so these extra keys are backward-compatible.
-            ckpt = {
+            # SLIM milestone checkpoint (model only) -- this is what eval loads, and
+            # it's ~1/3 the size of a full one, so the matrix stays disk-light.
+            slim = {
                 "model": model.state_dict(),
                 "config": OmegaConf.to_container(args, resolve=True),
                 "epoch": epoch,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "ema": ema_model.state_dict() if ema_model is not None else None,
-                "rng": {
-                    "torch": torch.get_rng_state(),
-                    "numpy": np.random.get_state(),
-                    "cuda": torch.cuda.get_rng_state_all() if device == "cuda" else None,
-                },
             }
             ckpt_name = f"simclr_{args.method}_{args.backbone}_epoch{epoch}_seed{args.seed}.pt"
             epoch_ckpt_dir = os.path.join(ckpt_dir, f"epoch{epoch}")
             ensure_dir(epoch_ckpt_dir)
             ckpt_path = os.path.join(epoch_ckpt_dir, ckpt_name)
             logger.info(f"==> Save checkpoint: {ckpt_path}")
-            torch.save(ckpt, ckpt_path)
+            torch.save(slim, ckpt_path)
+            # FULL resume state in ONE rolling file (overwritten each save, never
+            # accumulates) so a crashed/preempted run continues the LR schedule +
+            # momentum buffers exactly.
+            torch.save(
+                {**slim,
+                 "optimizer": optimizer.state_dict(),
+                 "scheduler": scheduler.state_dict(),
+                 "ema": ema_model.state_dict() if ema_model is not None else None,
+                 "rng": {
+                     "torch": torch.get_rng_state(),
+                     "numpy": np.random.get_state(),
+                     "cuda": torch.cuda.get_rng_state_all() if device == "cuda" else None,
+                 }},
+                last_full_path,
+            )
 
         # -------------------------
         # End-of-epoch eval/log/plots

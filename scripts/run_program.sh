@@ -35,6 +35,8 @@ NEG_AGG="${NEG_AGG:-hard}"
 DUAL_BN="${DUAL_BN:-true}"
 MAX_TEST_BATCHES="${MAX_TEST_BATCHES:--1}"   # -1 = full test set (final); e.g. 8 to iterate
 SUPERVISED="${SUPERVISED:-}"            # supervised AT reference baselines, e.g. "pgd_at trades" (item 8)
+ROBUST_PROBE="${ROBUST_PROBE:-true}"    # robust linear eval (head trained on PGD) -- reveals robustness; set false for clean probe
+BN_BRANCH="${BN_BRANCH:-adv}"           # dual-BN eval branch: 'adv' is where robustness lives (no-op for single-BN baselines)
 OUT="${OUT:-runs/${DATASET}_${BACKBONE}}"    # per-(dataset,backbone) dir so runs don't collide
 PY="${PY:-python}"
 
@@ -82,8 +84,14 @@ for seed in "${SEEDS_ARR[@]}"; do
     echo "==== ROBUSTNESS $m seed=$seed ===="
     surr_arg=()
     [[ -f "$surr" && "$m" != "baseline" ]] && surr_arg=(--surrogate_ckpt "$surr")
+    # Robust linear eval through the adv-BN branch -- the protocol that actually
+    # exposes robustness in dual-BN/AdvProp models (clean-BN + clean-probe reads
+    # ~0% even on a robust model). Gracefully degrades for single-BN baselines
+    # (bn_branch auto-disables; robust-probe still gives the fair comparison).
+    rp_arg=(); [[ "$ROBUST_PROBE" == "true" ]] && rp_arg=(--robust_probe)
     $PY eval_robustness.py --ckpt "$ck" "${surr_arg[@]}" --dataset "$DATASET" \
-        --eps_px "$EPS_PX" --out "$out_json" --max_test_batches "$MAX_TEST_BATCHES"
+        --eps_px "$EPS_PX" --bn_branch "$BN_BRANCH" "${rp_arg[@]}" \
+        --out "$out_json" --max_test_batches "$MAX_TEST_BATCHES"
   done
 done
 
