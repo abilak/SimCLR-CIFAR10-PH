@@ -104,6 +104,7 @@ catches a bad env/download for cents instead of dollars:
 export TMPDIR=$PWD/tmp && mkdir -p tmp
 DATASET=cifar100 BACKBONE=resnet18 METHODS="topoacl" SEEDS="0" \
   EPOCHS=1 SAVE_EVERY=1 WARMUP=0 ADV_STEPS=2 DUAL_BN=true MAX_TEST_BATCHES=2 \
+  PROBE_EPOCHS=1 PROBE_PER_CLASS=20 \
   OUT=runs/preflight bash scripts/run_program.sh && rm -rf runs/preflight
 ```
 Then the real runs (one per Lambda box):

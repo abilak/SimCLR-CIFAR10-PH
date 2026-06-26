@@ -37,6 +37,8 @@ MAX_TEST_BATCHES="${MAX_TEST_BATCHES:--1}"   # -1 = full test set (final); e.g. 
 SUPERVISED="${SUPERVISED:-}"            # supervised AT reference baselines, e.g. "pgd_at trades" (item 8)
 ROBUST_PROBE="${ROBUST_PROBE:-true}"    # robust linear eval (head trained on PGD) -- reveals robustness; set false for clean probe
 BN_BRANCH="${BN_BRANCH:-adv}"           # dual-BN eval branch: 'adv' is where robustness lives (no-op for single-BN baselines)
+PROBE_EPOCHS="${PROBE_EPOCHS:-}"        # robust-probe training epochs (empty=eval default 20; set small e.g. 1 for fast preflight)
+PROBE_PER_CLASS="${PROBE_PER_CLASS:-}"  # labeled probe images/class (empty=default 500; set small e.g. 20 for fast preflight)
 OUT="${OUT:-runs/${DATASET}_${BACKBONE}}"    # per-(dataset,backbone) dir so runs don't collide
 PY="${PY:-python}"
 
@@ -89,8 +91,10 @@ for seed in "${SEEDS_ARR[@]}"; do
     # ~0% even on a robust model). Gracefully degrades for single-BN baselines
     # (bn_branch auto-disables; robust-probe still gives the fair comparison).
     rp_arg=(); [[ "$ROBUST_PROBE" == "true" ]] && rp_arg=(--robust_probe)
+    pe_arg=(); [[ -n "$PROBE_EPOCHS" ]] && pe_arg=(--probe_epochs "$PROBE_EPOCHS")
+    pc_arg=(); [[ -n "$PROBE_PER_CLASS" ]] && pc_arg=(--probe_per_class "$PROBE_PER_CLASS")
     $PY eval_robustness.py --ckpt "$ck" "${surr_arg[@]}" --dataset "$DATASET" \
-        --eps_px "$EPS_PX" --bn_branch "$BN_BRANCH" "${rp_arg[@]}" \
+        --eps_px "$EPS_PX" --bn_branch "$BN_BRANCH" "${rp_arg[@]}" "${pe_arg[@]}" "${pc_arg[@]}" \
         --out "$out_json" --max_test_batches "$MAX_TEST_BATCHES"
   done
 done
