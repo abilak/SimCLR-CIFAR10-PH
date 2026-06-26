@@ -687,6 +687,11 @@ def train(args: DictConfig) -> None:
             logger.warning(f"[resume] no last.pt; model-only from {last_p} @ epoch {ck['epoch']} "
                            f"(optimizer/scheduler/RNG reset); continuing at {start_epoch}")
 
+    # Stability guards (matter for PH methods on larger point clouds, e.g. STL-64).
+    grad_clip = float(getattr(args.train, "grad_clip", 5.0))   # 0 disables
+    nan_skip_limit = int(getattr(args.train, "nan_skip_limit", 50))
+    nan_skips = 0
+
     for epoch in range(start_epoch, int(args.epochs) + 1):
         loss_meter = AverageMeter("loss")
         bar = tqdm(train_loader, total=steps_per_epoch)
@@ -729,7 +734,26 @@ def train(args: DictConfig) -> None:
             loss, _ = compute_training_loss(model, x, method_eff, P,
                                             teacher_model=ema_model if method_eff in CONSIST_METHODS else None)
 
+            # Non-finite-loss guard: a single bad batch (e.g. a degenerate PH cloud)
+            # shouldn't poison the model or NaN out a multi-day run -- skip it.
+            if not torch.isfinite(loss):
+                nan_skips += 1
+                logger.warning(f"[skip] non-finite loss at epoch {epoch} step {step} "
+                               f"({nan_skips} total); skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                if nan_skips > nan_skip_limit:
+                    raise RuntimeError(f"too many non-finite losses ({nan_skips}); aborting "
+                                       f"(lower learning_rate / raise grad_clip / add warmup).")
+                continue
+
             loss.backward()
+            # Gradient clipping: PH/topology losses can spike (the SW/MST gradient
+            # scales with point count -- STL-64's 64-pt clouds are ~4x CIFAR's), which
+            # can blow up a freshly-initialized encoder. Clipping bounds the step so a
+            # spike can't NaN the run. High default => no-op for normal training.
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             scheduler.step()
             if ema_model is not None:

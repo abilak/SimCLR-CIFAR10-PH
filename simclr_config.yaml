@@ -40,6 +40,9 @@ train:
   warmup_epochs: 0     # baseline warmup even if method=phsim/hybrid
   resume: true          # auto-resume from the latest checkpoint for this (method,seed)
                         # if present (crash / spot-preemption safe). set false to force restart.
+  grad_clip: 5.0        # clip grad-norm (0 disables). guards PH/topology gradient spikes
+                        # (esp. STL-64's larger point clouds) from NaN-ing the run.
+  nan_skip_limit: 50    # abort if more than this many non-finite-loss batches are skipped
 
 optim:
   lr_min: 1e-3
