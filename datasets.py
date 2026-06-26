@@ -20,10 +20,15 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100, STL10
 
 
+# Resolution is baked into the dataset NAME (e.g. stl10_64) so it flows through
+# training, eval, and the checkpoint config identically -- no separate image_size
+# knob that could desync train vs eval. `loader` picks the torchvision class.
 _REGISTRY = {
-    "cifar10":  dict(n_classes=10,  image_size=32),
-    "cifar100": dict(n_classes=100, image_size=32),
-    "stl10":    dict(n_classes=10,  image_size=96),
+    "cifar10":   dict(n_classes=10,  image_size=32, loader="cifar10"),
+    "cifar100":  dict(n_classes=100, image_size=32, loader="cifar100"),
+    "stl10":     dict(n_classes=10,  image_size=96, loader="stl10"),   # native res
+    "stl10_64":  dict(n_classes=10,  image_size=64, loader="stl10"),   # downsized (compute/budget)
+    "stl10_32":  dict(n_classes=10,  image_size=32, loader="stl10"),
 }
 
 
@@ -85,12 +90,12 @@ class TwoView(torch.utils.data.Dataset):
 
 def make_ssl_trainset(name: str, root: str, color_strength: float = 0.5, download: bool = True):
     """SSL pretraining set (two views). For STL-10 this is the large unlabeled split
-    (train+unlabeled); for CIFAR it is the train split."""
-    name = str(name).lower()
+    (train+unlabeled); for CIFAR it is the train split. Crop sized to image_size(name)."""
+    loader = dataset_info(name)["loader"]
     tf = ssl_train_transform(name, color_strength)
-    if name == "stl10":
+    if loader == "stl10":
         base = STL10(root=root, split="train+unlabeled", transform=None, download=download)
-    elif name == "cifar100":
+    elif loader == "cifar100":
         base = CIFAR100(root=root, train=True, transform=None, download=download)
     else:
         base = CIFAR10(root=root, train=True, transform=None, download=download)
@@ -98,13 +103,20 @@ def make_ssl_trainset(name: str, root: str, color_strength: float = 0.5, downloa
 
 
 def make_eval_sets(name: str, root: str, download: bool = True):
-    """Labeled (train, test) sets in [0,1] for the linear probe + attacks."""
-    name = str(name).lower()
-    tf = transforms.Compose([transforms.ToTensor()])
-    if name == "stl10":
+    """
+    Labeled (train, test) sets in [0,1] for the linear probe + attacks. Images are
+    Resized to image_size(name) so eval matches the resolution the encoder was
+    trained at (critical for the downsized stl10_64/stl10_32 variants -- a 96px
+    eval on a 64px-trained encoder would silently tank robustness). For native-res
+    datasets the Resize is a no-op.
+    """
+    info = dataset_info(name)
+    loader, sz = info["loader"], info["image_size"]
+    tf = transforms.Compose([transforms.Resize(sz), transforms.ToTensor()])
+    if loader == "stl10":
         train = STL10(root=root, split="train", transform=tf, download=download)
         test = STL10(root=root, split="test", transform=tf, download=download)
-    elif name == "cifar100":
+    elif loader == "cifar100":
         train = CIFAR100(root=root, train=True, transform=tf, download=download)
         test = CIFAR100(root=root, train=False, transform=tf, download=download)
     else:

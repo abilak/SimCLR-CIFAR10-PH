@@ -90,18 +90,37 @@ accuracy — now measurable because robustness exists in this regime.
 reviewer values more than 2 extra seeds.) Add the **RoCL** row once that port is
 built (next).
 
-### Phase 2 — generalization datasets, reduced (~5 days each).
-```bash
-DATASET=cifar100 BACKBONE=resnet18 \
-  METHODS="baseline adv_baseline topoacl rawacl" \
-  SEEDS="0 1 2" EPOCHS=200 ADV_STEPS=5 DUAL_BN=true MAX_TEST_BATCHES=-1 \
-  bash scripts/run_program.sh
+### Phase 2 — generalization datasets, on Lambda IN PARALLEL with local CIFAR-10.
+Run these on rented Lambda **A10** GPUs ($1.29/hr; ≈ the local card's speed — do
+NOT rent A100/H100) *while* CIFAR-10 runs locally, so they cost ~0 extra wall-clock.
+Reduced protocol (4 methods, 2 seeds, 200 ep, steps=3) — standard for secondary
+datasets. **`stl10` must be the downsized `stl10_64`** (native 96×96 makes the PH
+methods ~15× costlier/epoch and blows the budget; 64px is still 4× CIFAR's pixels).
+All resolutions/labels are validated end-to-end with real data.
 
-DATASET=stl10 BACKBONE=resnet18 \
-  METHODS="baseline adv_baseline topoacl rawacl" \
-  SEEDS="0 1 2" EPOCHS=200 ADV_STEPS=5 DUAL_BN=true MAX_TEST_BATCHES=-1 \
-  bash scripts/run_program.sh
+**Preflight on each fresh Lambda box (1 epoch, ~minutes) BEFORE the real run** —
+catches a bad env/download for cents instead of dollars:
+```bash
+export TMPDIR=$PWD/tmp && mkdir -p tmp
+DATASET=cifar100 BACKBONE=resnet18 METHODS="topoacl" SEEDS="0" \
+  EPOCHS=1 SAVE_EVERY=1 WARMUP=0 ADV_STEPS=2 DUAL_BN=true MAX_TEST_BATCHES=2 \
+  OUT=runs/preflight bash scripts/run_program.sh && rm -rf runs/preflight
 ```
+Then the real runs (one per Lambda box):
+```bash
+# box A (~$65, ~2-3 days)
+DATASET=cifar100 BACKBONE=resnet18 METHODS="baseline adv_baseline topoacl rawacl" \
+  SEEDS="0 1" EPOCHS=200 SAVE_EVERY=100 WARMUP=10 ADV_STEPS=3 DUAL_BN=true \
+  MAX_TEST_BATCHES=-1 bash scripts/run_program.sh
+
+# box B (~$190 at 2 seeds; ~$95 at SEEDS="0"; ~4-6 days)
+DATASET=stl10_64 BACKBONE=resnet18 METHODS="baseline adv_baseline topoacl rawacl" \
+  SEEDS="0 1" EPOCHS=200 SAVE_EVERY=100 WARMUP=10 ADV_STEPS=3 DUAL_BN=true \
+  MAX_TEST_BATCHES=-1 bash scripts/run_program.sh
+```
+Budget: ~$255 of the $276 for both at 2 seeds (thin margin — drop STL to `SEEDS="0"`
+for ~$160 total and a safety buffer). **Tear down each Lambda instance the moment its
+run + eval finishes** (it bills idle time). Copy the result JSONs back to git/home.
 
 ### Phase 3 — architecture check, reduced (~5–6 days).
 ```bash

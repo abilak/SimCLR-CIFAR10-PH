@@ -361,7 +361,9 @@ def finetune(args: DictConfig) -> None:
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
     ])
-    test_transform = transforms.Compose([transforms.ToTensor()])
+    # Resize test images to the training resolution (no-op for native-res datasets;
+    # essential for downsized stl10_64/stl10_32 so eval matches what the encoder saw).
+    test_transform = transforms.Compose([transforms.Resize(img_sz), transforms.ToTensor()])
 
     data_dir = hydra.utils.to_absolute_path(args.data_dir)
     train_set, test_set = make_eval_sets(dataset_name, root=data_dir, download=True)
