@@ -93,8 +93,17 @@ for seed in "${SEEDS_ARR[@]}"; do
     rp_arg=(); [[ "$ROBUST_PROBE" == "true" ]] && rp_arg=(--robust_probe)
     pe_arg=(); [[ -n "$PROBE_EPOCHS" ]] && pe_arg=(--probe_epochs "$PROBE_EPOCHS")
     pc_arg=(); [[ -n "$PROBE_PER_CLASS" ]] && pc_arg=(--probe_per_class "$PROBE_PER_CLASS")
+    # Per-method eval branch: AdvProp methods (adv_baseline/adv_phsim/adv_swcontrol)
+    # put robustness in adv-BN (trained in train mode). The CONSISTENCY methods
+    # (topoacl/rawacl) run their consistency in eval mode, so their adv-BN running
+    # stats never train -- their deployable representation is clean-BN. Evaluating
+    # them on adv-BN reads garbage (~chance). So force clean-BN for those.
+    case "$m" in
+      topoacl|rawacl) mbn=clean ;;
+      *)              mbn="$BN_BRANCH" ;;
+    esac
     $PY eval_robustness.py --ckpt "$ck" "${surr_arg[@]}" --dataset "$DATASET" \
-        --eps_px "$EPS_PX" --bn_branch "$BN_BRANCH" "${rp_arg[@]}" "${pe_arg[@]}" "${pc_arg[@]}" \
+        --eps_px "$EPS_PX" --bn_branch "$mbn" "${rp_arg[@]}" "${pe_arg[@]}" "${pc_arg[@]}" \
         --out "$out_json" --max_test_batches "$MAX_TEST_BATCHES"
   done
 done

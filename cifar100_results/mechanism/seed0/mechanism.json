@@ -1,0 +1,94 @@
+{
+  "baseline": {
+    "clean": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 40.09,
+      "mean_total_pers_h0": 1422.7040584694507,
+      "mean_total_pers_h1": 47.17654585203712,
+      "mean_pers_entropy_h0": 4.330427767994582,
+      "mean_pers_entropy_h1": 3.3347040128868652,
+      "gamma": 46.332455102226454
+    },
+    "adv": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 29.06,
+      "mean_total_pers_h0": 1215.797416406378,
+      "mean_total_pers_h1": 36.90879874794766,
+      "mean_pers_entropy_h0": 4.320317860797416,
+      "mean_pers_entropy_h1": 3.0029276030631276,
+      "gamma": 34.23800349912088
+    },
+    "gamma_clean": 46.332455102226454,
+    "gamma_adv": 34.23800349912088,
+    "gamma_relative_drop": 0.26103627740901625
+  },
+  "adv_baseline": {
+    "clean": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 39.28,
+      "mean_total_pers_h0": 1324.7714139382917,
+      "mean_total_pers_h1": 50.146466876444656,
+      "mean_pers_entropy_h0": 4.32731063201189,
+      "mean_pers_entropy_h1": 3.322406487118186,
+      "gamma": 41.905259092524155
+    },
+    "adv": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 29.65,
+      "mean_total_pers_h0": 1151.0159209202827,
+      "mean_total_pers_h1": 41.021612849948184,
+      "mean_pers_entropy_h0": 4.315358885665393,
+      "mean_pers_entropy_h1": 3.0244940675041505,
+      "gamma": 35.596126414012
+    },
+    "gamma_clean": 41.905259092524155,
+    "gamma_adv": 35.596126414012,
+    "gamma_relative_drop": 0.15055706169438046
+  },
+  "topoacl": {
+    "clean": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 40.3,
+      "mean_total_pers_h0": 1420.0779872037074,
+      "mean_total_pers_h1": 46.667671188581025,
+      "mean_pers_entropy_h0": 4.331541044443474,
+      "mean_pers_entropy_h1": 3.354407869573761,
+      "gamma": 44.82392703038099
+    },
+    "adv": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 30.17,
+      "mean_total_pers_h0": 1218.7322922285941,
+      "mean_total_pers_h1": 38.96339016719429,
+      "mean_pers_entropy_h0": 4.322529212028297,
+      "mean_pers_entropy_h1": 3.036470251614799,
+      "gamma": 34.10501020378934
+    },
+    "gamma_clean": 44.82392703038099,
+    "gamma_adv": 34.10501020378934,
+    "gamma_relative_drop": 0.23913381840298217
+  },
+  "rawacl": {
+    "clean": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 39.94,
+      "mean_total_pers_h0": 1438.8856332484083,
+      "mean_total_pers_h1": 45.1613764637336,
+      "mean_pers_entropy_h0": 4.3323529020327225,
+      "mean_pers_entropy_h1": 3.3324778904433576,
+      "gamma": 44.98608526370877
+    },
+    "adv": {
+      "mean_n_h0": 79.0,
+      "mean_n_h1": 30.07,
+      "mean_total_pers_h0": 1249.2664500802289,
+      "mean_total_pers_h1": 38.81145186194311,
+      "mean_pers_entropy_h0": 4.324493970765119,
+      "mean_pers_entropy_h1": 3.04102103972736,
+      "gamma": 33.741610368076955
+    },
+    "gamma_clean": 44.98608526370877,
+    "gamma_adv": 33.741610368076955,
+    "gamma_relative_drop": 0.24995450992716128
+  }
+}

@@ -41,7 +41,7 @@ from phtopo.losses import (
     topo_consistency_loss, raw_consistency_loss,
 )
 from phtopo.adv import pgd_ascent_on_loss, eval_mode
-from phtopo.dual_bn import convert_to_dual_bn, bn_route, count_dual_bn, sync_adv_bn_from_clean
+from phtopo.dual_bn import convert_to_dual_bn, bn_route, count_dual_bn, sync_adv_bn_from_clean, load_state_dict_auto
 from phtopo.descriptors import class_separation_gamma
 
 logger = logging.getLogger(__name__)

@@ -5,3 +5,4 @@ runs/*stream
 log/
 visuals/
 data/
+cifar100_resnet18/

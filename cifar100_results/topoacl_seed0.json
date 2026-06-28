@@ -1,0 +1,44 @@
+{
+  "eps": 0.03137254901960784,
+  "eps_px": 8.0,
+  "clean_acc": 0.01,
+  "pgd_by_steps": {
+    "10": 0.01,
+    "20": 0.01,
+    "50": 0.01,
+    "100": 0.01
+  },
+  "pgd_by_restarts": {
+    "1": 0.01,
+    "5": 0.01
+  },
+  "pgd_by_eps_px": {
+    "2.0": 0.01,
+    "4.0": 0.01,
+    "8.0": 0.01,
+    "16.0": 0.01,
+    "32.0": 0.01,
+    "64.0": 0.01,
+    "128.0": 0.01
+  },
+  "autoattack": {
+    "available": 1.0,
+    "autoattack": 0.009999999776482582,
+    "square": 0.009999999776482582
+  },
+  "transfer_acc": 0.01,
+  "masking": {
+    "pgd_not_plateaued": false,
+    "large_eps_not_zero": false,
+    "square_gap": false,
+    "autoattack_gap": false,
+    "transfer_gap": false,
+    "verdict": "no masking signal detected",
+    "robust_acc_headline": 0.009999999776482582
+  },
+  "ckpt": "runs/cifar100_resnet18/upstream/topoacl_seed0/checkpoints/upstream/topoacl/seed0/epoch200/simclr_topoacl_resnet18_epoch200_seed0.pt",
+  "surrogate_ckpt": "runs/cifar100_resnet18/upstream/baseline_seed0/checkpoints/upstream/baseline/seed0/epoch200/simclr_baseline_resnet18_epoch200_seed0.pt",
+  "clean_probe_per_class": 500,
+  "probe": "robust",
+  "bn_branch": "adv"
+}
