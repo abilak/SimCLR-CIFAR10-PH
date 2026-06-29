@@ -133,6 +133,7 @@ def train(args, device):
             sched.load_state_dict(ck["scheduler"]); start_epoch = ck["epoch"] + 1
             print(f"[adv_sup] resume from epoch {ck['epoch']} -> {start_epoch}")
 
+    nan_skips = 0
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         tot, correct, loss_sum = 0, 0, 0.0
@@ -155,7 +156,20 @@ def train(args, device):
                     logp_adv, p_clean, reduction="batchmean")
             else:
                 raise ValueError(args.method)
-            loss.backward(); opt.step()
+            # Non-finite guard + gradient clipping: TRADES' beta*KL term can explode
+            # a fresh classifier within the first epoch (-> loss=nan, acc pinned at
+            # chance). Clip bounds the step; skip + abort-if-persistent backstops it.
+            if not torch.isfinite(loss):
+                nan_skips += 1
+                opt.zero_grad(set_to_none=True)
+                if nan_skips > 50:
+                    raise RuntimeError("[adv_sup] too many non-finite losses; abort "
+                                       "(lower --lr or --beta).")
+                continue
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
             loss_sum += float(loss) * x.size(0); tot += x.size(0)
             correct += int((logits.argmax(1) == y).sum())
         sched.step()
@@ -200,6 +214,7 @@ def main():
     ap.add_argument("--eps_px", type=float, default=8.0)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--beta", type=float, default=6.0, help="TRADES robustness weight")
+    ap.add_argument("--grad_clip", type=float, default=1.0, help="clip grad-norm (0 disables); guards TRADES NaN")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save_every", type=int, default=20)
     ap.add_argument("--workers", type=int, default=4)

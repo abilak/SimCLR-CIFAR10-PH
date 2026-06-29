@@ -86,10 +86,8 @@ for seed in "${SEEDS_ARR[@]}"; do
     echo "==== ROBUSTNESS $m seed=$seed ===="
     surr_arg=()
     [[ -f "$surr" && "$m" != "baseline" ]] && surr_arg=(--surrogate_ckpt "$surr")
-    # Robust linear eval through the adv-BN branch -- the protocol that actually
-    # exposes robustness in dual-BN/AdvProp models (clean-BN + clean-probe reads
-    # ~0% even on a robust model). Gracefully degrades for single-BN baselines
-    # (bn_branch auto-disables; robust-probe still gives the fair comparison).
+    # Robust linear eval (head trained on PGD) -- without it, robustness reads ~0%
+    # even on a robust model. The BN branch is chosen PER METHOD just below.
     rp_arg=(); [[ "$ROBUST_PROBE" == "true" ]] && rp_arg=(--robust_probe)
     pe_arg=(); [[ -n "$PROBE_EPOCHS" ]] && pe_arg=(--probe_epochs "$PROBE_EPOCHS")
     pc_arg=(); [[ -n "$PROBE_PER_CLASS" ]] && pc_arg=(--probe_per_class "$PROBE_PER_CLASS")
