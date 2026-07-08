@@ -6,3 +6,6 @@ log/
 visuals/
 data/
 cifar100_resnet18/
+*.pt
+cifar10_ckpts_backup/
+runs/
