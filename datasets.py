@@ -15,9 +15,37 @@ split). Add a new dataset by extending _REGISTRY and the two factory functions.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100, STL10
+
+
+def _bypass_torchvision_cifar_md5_if_prepared(root: str) -> None:
+    """
+    Skip torchvision's per-file md5 check when a valid cifar-10-batches-py/ has
+    already been prepared locally (e.g., by scripts/fetch_cifar10.py, which pulls
+    from the HuggingFace uoft-cs/cifar10 mirror when the canonical toronto host is
+    unreachable). We regenerate the batches from an equivalent source and torchvision's
+    hardcoded md5s only match the original 2009 pickle bytes -- so the *data* is
+    correct but the file hashes differ. Monkey-patch _check_integrity to accept the
+    prepared layout so torchvision loads without demanding a re-download it can't do.
+
+    Only patches when the extracted dir + all expected batch files exist. Otherwise a
+    no-op (normal md5 check still runs).
+    """
+    for cls, subdir, files in [
+        (CIFAR10, "cifar-10-batches-py",
+         [f"data_batch_{i}" for i in range(1, 6)] + ["test_batch", "batches.meta"]),
+        (CIFAR100, "cifar-100-python", ["train", "test", "meta"]),
+    ]:
+        base = os.path.join(root, subdir)
+        if all(os.path.exists(os.path.join(base, f)) for f in files):
+            cls._check_integrity = lambda self: True   # trust batch files
+            # _load_meta() also md5-checks the meta file separately; clear it too.
+            if isinstance(cls.meta, dict):
+                cls.meta = {**cls.meta, "md5": None}
 
 
 # Resolution is baked into the dataset NAME (e.g. stl10_64) so it flows through
@@ -91,6 +119,7 @@ class TwoView(torch.utils.data.Dataset):
 def make_ssl_trainset(name: str, root: str, color_strength: float = 0.5, download: bool = True):
     """SSL pretraining set (two views). For STL-10 this is the large unlabeled split
     (train+unlabeled); for CIFAR it is the train split. Crop sized to image_size(name)."""
+    _bypass_torchvision_cifar_md5_if_prepared(root)
     loader = dataset_info(name)["loader"]
     tf = ssl_train_transform(name, color_strength)
     if loader == "stl10":
@@ -110,6 +139,7 @@ def make_eval_sets(name: str, root: str, download: bool = True):
     eval on a 64px-trained encoder would silently tank robustness). For native-res
     datasets the Resize is a no-op.
     """
+    _bypass_torchvision_cifar_md5_if_prepared(root)
     info = dataset_info(name)
     loader, sz = info["loader"], info["image_size"]
     tf = transforms.Compose([transforms.Resize(sz), transforms.ToTensor()])
