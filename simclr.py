@@ -237,7 +237,12 @@ def nt_xent(x: torch.Tensor, t=0.5) -> torch.Tensor:
 CLEAN_METHODS = {"baseline", "phsim", "swcontrol", "hybrid"}
 ADV_WRAP_METHODS = {"adv_baseline", "adv_phsim", "adv_swcontrol"}  # adversarial SSL (ACL-style)
 CONSIST_METHODS = {"topoacl", "rawacl"}                            # clean NT-Xent + adv consistency
-ALL_METHODS = CLEAN_METHODS | ADV_WRAP_METHODS | CONSIST_METHODS
+# Redesign: adversarial NT-Xent (AdvProp, the recipe that gives real robustness) PLUS a
+# topology/raw consistency regularizer -- the fair "does topology ADD value on top of a
+# working robust method?" test. adv_topoacl vs adv_rawacl is the topology-specificity test
+# IN a robust regime; adv_topoacl vs adv_baseline asks whether topology beats plain AdvCL.
+ADV_CONSIST_METHODS = {"adv_topoacl", "adv_rawacl"}
+ALL_METHODS = CLEAN_METHODS | ADV_WRAP_METHODS | CONSIST_METHODS | ADV_CONSIST_METHODS
 
 
 def _ph_forward(model, x, P):
@@ -420,6 +425,48 @@ def compute_training_loss(model, x, method, P, teacher_model=None):
         st = {**st, "base_ntxent": float(base.detach()), "consistency": float(cons.detach())}
         return loss, st
 
+    # ----- REDESIGN: adversarial NT-Xent (AdvProp) + topology consistency ---------
+    # This is adv_baseline's robust recipe (which gives ~25% AutoAttack on CIFAR-10)
+    # PLUS a topology/raw consistency regularizer. Robustness comes from the
+    # adversarial NT-Xent on the adv-BN branch (trained in TRAIN mode, so adv-BN is a
+    # real robust branch here -- unlike plain topoacl); the consistency term then adds
+    # topology structure on top. Evaluate these on the adv-BN branch.
+    if method in ADV_CONSIST_METHODS:
+        consist = "topoacl" if method == "adv_topoacl" else "rawacl"
+
+        def ntxent_closure(xp):
+            _, _, rep = model(xp)
+            return nt_xent(rep, P["temperature"])
+
+        if dual_bn:
+            # inner PGD maximizes NT-Xent through adv-BN (eval; no stat update)
+            with eval_mode(model), bn_route("adv"):
+                x_adv = pgd_ascent_on_loss(ntxent_closure, x, eps, alpha, steps, P["adv_random_start"])
+                # clean topology reference through the SAME (adv) branch+mode as the
+                # attack -> consistency reflects perturbation drift, not a branch gap.
+                maps_ref = [m.detach() for m in _ph_maps_only(model, x, P)]
+            with bn_route("clean"):
+                _, rep_clean = _ph_forward(model, x, P)     # trains clean-BN (clean acc / inference-neutral)
+                l_clean = nt_xent(rep_clean, P["temperature"])
+            with bn_route("adv"):
+                maps_adv, rep_adv = _ph_forward(model, x_adv, P)   # TRAIN mode: adv-BN learns robustness
+                l_adv = nt_xent(rep_adv, P["temperature"])
+            cons, st = _consistency_maps(consist, maps_ref, maps_adv, P)
+            loss = l_clean + l_adv + P["adv_beta"] * cons
+            st = {**st, "clean_loss": float(l_clean.detach()), "adv_loss": float(l_adv.detach()),
+                  "consistency": float(cons.detach())}
+            return loss, st
+
+        # single-BN fallback: adversarial NT-Xent (clean + adv) + consistency
+        with eval_mode(model):
+            x_adv = pgd_ascent_on_loss(ntxent_closure, x, eps, alpha, steps, P["adv_random_start"])
+            maps_ref = [m.detach() for m in _ph_maps_only(model, x, P)]
+        _, rep_clean = _ph_forward(model, x, P)
+        maps_adv, rep_adv = _ph_forward(model, x_adv, P)
+        cons, st = _consistency_maps(consist, maps_ref, maps_adv, P)
+        loss = nt_xent(rep_clean, P["temperature"]) + nt_xent(rep_adv, P["temperature"]) + P["adv_beta"] * cons
+        return loss, {**st, "consistency": float(cons.detach())}
+
     raise ValueError(f"Unknown method={method}. Use one of {sorted(ALL_METHODS)}.")
 
 
@@ -544,7 +591,7 @@ def train(args: DictConfig) -> None:
     # the teacher matches). Default off => zero change to the single-BN path.
     _adv_cfg0 = getattr(args, "adv", None)
     _method_lc0 = str(args.method).lower()
-    _adv_method = _method_lc0 in (ADV_WRAP_METHODS | CONSIST_METHODS)
+    _adv_method = _method_lc0 in (ADV_WRAP_METHODS | CONSIST_METHODS | ADV_CONSIST_METHODS)
     use_dual_bn = (bool(getattr(_adv_cfg0, "dual_bn", False)) and _adv_method) if _adv_cfg0 is not None else False
     if use_dual_bn:
         convert_to_dual_bn(model)

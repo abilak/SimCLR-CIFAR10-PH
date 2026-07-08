@@ -43,7 +43,7 @@ from phtopo.dual_bn import (
     has_dual_bn, count_dual_bn, state_dict_is_dual_bn, load_state_dict_auto,
     sync_adv_bn_from_clean,
 )
-from simclr import compute_training_loss, ema_update, ADV_WRAP_METHODS, CONSIST_METHODS
+from simclr import compute_training_loss, ema_update, ADV_WRAP_METHODS, CONSIST_METHODS, ADV_CONSIST_METHODS
 
 P_SINGLE = dict(temperature=0.5, num_points=16, neg_k=4, margin=1.0, ndir=16, ph_lambda=1.0,
                 neg_agg="hard", softmin_temp=0.1, alpha=0.9, multiscale=False,
@@ -305,7 +305,11 @@ def _branch_grad_sums(m):
 def test_end_to_end_methods_dual_bn():
     torch.manual_seed(5)
     x = torch.rand(8, 3, 32, 32)
-    for meth in sorted(ADV_WRAP_METHODS | CONSIST_METHODS):
+    # adv-BN trains in TRAIN mode for AdvProp methods AND the redesign (adv_topoacl/
+    # adv_rawacl, which do adversarial NT-Xent on adv-BN); CONSIST (topoacl/rawacl)
+    # run consistency in eval mode so adv-BN stats don't advance.
+    adv_bn_trains = ADV_WRAP_METHODS | ADV_CONSIST_METHODS
+    for meth in sorted(ADV_WRAP_METHODS | CONSIST_METHODS | ADV_CONSIST_METHODS):
         m = _model(); convert_to_dual_bn(m); m.train(); m.zero_grad(set_to_none=True)
         d = _first_dual(m)
         cn0, an0 = int(d.clean_bn.num_batches_tracked), int(d.adv_bn.num_batches_tracked)
@@ -324,7 +328,7 @@ def test_end_to_end_methods_dual_bn():
         #   CONSIST (topoacl/rawacl): the consistency runs the adv branch in EVAL
         #     mode (to mode-match the clean target and isolate perturbation drift),
         #     so adv-BN running stats do NOT advance -- its AFFINE params still train.
-        if meth in ADV_WRAP_METHODS:
+        if meth in adv_bn_trains:
             assert int(d.adv_bn.num_batches_tracked) == an0 + 1, \
                 f"{meth}: adv_bn not stepped once ({int(d.adv_bn.num_batches_tracked)-an0})"
         else:
@@ -337,9 +341,10 @@ def test_end_to_end_methods_dual_bn():
         c, a = _branch_grad_sums(m)
         assert c > 0, f"{meth}: clean-BN branch received no gradient"
         assert a > 0, f"{meth}: adv-BN branch received no gradient (affine must train)"
-        if meth in ADV_WRAP_METHODS:
+        if meth in (ADV_WRAP_METHODS | ADV_CONSIST_METHODS):
             assert "clean_loss" in st and "adv_loss" in st, f"{meth}: missing AdvProp clean/adv loss split"
-    print(f"[OK] end-to-end dual-BN for {len(ADV_WRAP_METHODS|CONSIST_METHODS)} methods: "
+    n = len(ADV_WRAP_METHODS | CONSIST_METHODS | ADV_CONSIST_METHODS)
+    print(f"[OK] end-to-end dual-BN for {n} methods: "
           "finite loss, both branches trained, correct adv-BN stat policy, no attack grad leak, train restored")
 
 
