@@ -31,6 +31,7 @@ EPS_PX="${EPS_PX:-8}"
 ADV_STEPS="${ADV_STEPS:-5}"             # inner-PGD steps (3 to iterate faster, 5 for headline)
 SOURCE_LAYER="${SOURCE_LAYER:-layer3}"
 EXTRA_LAYERS="${EXTRA_LAYERS:-[]}"      # multiscale, e.g. "[layer2]"
+BETA="${BETA:-}"                        # consistency weight (adv.beta); empty=config default (1.0)
 NEG_AGG="${NEG_AGG:-hard}"
 DUAL_BN="${DUAL_BN:-true}"
 MAX_TEST_BATCHES="${MAX_TEST_BATCHES:--1}"   # -1 = full test set (final); e.g. 8 to iterate
@@ -63,11 +64,13 @@ for seed in "${SEEDS_ARR[@]}"; do
     fi
     rd="$OUT/upstream/${m}_seed${seed}"
     echo "==== TRAIN $m seed=$seed (dataset=$DATASET backbone=$BACKBONE) ===="
+    beta_override=(); [[ -n "$BETA" ]] && beta_override=(adv.beta="$BETA")
     $PY simclr.py method="$m" backbone="$BACKBONE" seed="$seed" dataset="$DATASET" \
         epochs="$EPOCHS" log_interval="$SAVE_EVERY" train.warmup_epochs="$WARMUP" \
         data.subset_size=-1 train.max_steps=-1 \
         ph.source_layer="$SOURCE_LAYER" "ph.extra_layers=$EXTRA_LAYERS" ph.neg_agg="$NEG_AGG" \
         adv.steps="$ADV_STEPS" adv.eps=$($PY -c "print($EPS_PX/255)") adv.dual_bn="$DUAL_BN" \
+        "${beta_override[@]}" \
         hydra.run.dir="$rd" hydra.output_subdir=.hydra hydra.job.chdir=true
   done
 done
